@@ -1,0 +1,10 @@
+# Logs de runtime (gerados ao executar o configurador)
+logs/
+*.log
+
+# Artefato de build (gerado pelo passo de bundle, opcional versionar)
+dist/
+
+# Lixo do Windows
+Thumbs.db
+desktop.ini
