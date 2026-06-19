@@ -205,6 +205,23 @@ function Resolve-Manager {
     return $null
 }
 
+# Extrai as ultimas linhas nao-vazias de uma saida (para detalhar erros).
+function Get-OutputTail {
+    param($Lines, [int] $Count = 15)
+    $arr = @($Lines | ForEach-Object { "$_" } | Where-Object { $_ -match '\S' })
+    if ($arr.Count -eq 0) { return '' }
+    return (($arr | Select-Object -Last $Count) -join [Environment]::NewLine)
+}
+
+# Resumo de 1 linha (truncado) a partir da saida, para o campo Detail.
+function Get-ErrorDetail {
+    param($Lines, [int] $Code, [int] $Max = 160)
+    $last = $Lines | ForEach-Object { "$_" } | Where-Object { $_ -match '\S' } | Select-Object -Last 1
+    if (-not $last) { return "ExitCode $Code" }
+    if ($last.Length -gt $Max) { $last = $last.Substring(0, $Max) + '...' }
+    return "ExitCode $Code - $last"
+}
+
 # --- Instala um pacote ------------------------------------------------------
 function Install-SoftwarePackage {
     param($Pkg, [string] $Preferred = 'auto')
@@ -227,7 +244,7 @@ function Install-SoftwarePackage {
         }
         Write-Log "[choco] Instalando '$($Pkg.Name)' ($($Pkg.Choco))..." -Level STEP
         $argsList = @('install', $Pkg.Choco, '-y', '--no-progress') + $Pkg.ChocoArgs
-        & choco @argsList
+        & choco @argsList | Tee-Object -Variable out   # mostra ao vivo E captura a saida
         $code = $LASTEXITCODE
         if ($code -eq 0) {
             Write-Log "'$($Pkg.Name)' instalado (choco)." -Level OK
@@ -239,7 +256,10 @@ function Install-SoftwarePackage {
         }
         else {
             Write-Log "Falha ao instalar '$($Pkg.Name)' (choco). ExitCode: $code" -Level ERRO
-            Add-FeatureResult -Name $Pkg.Name -Status 'Falha' -Detail "choco ExitCode $code"
+            $tail = Get-OutputTail $out
+            if ($tail) { Write-Log "Detalhe (choco):`n$tail" -Level ERRO }
+            Write-Log "Log completo: C:\ProgramData\chocolatey\logs\chocolatey.log" -Level INFO
+            Add-FeatureResult -Name $Pkg.Name -Status 'Falha' -Detail (Get-ErrorDetail $out $code)
         }
     }
     else {
@@ -247,7 +267,7 @@ function Install-SoftwarePackage {
         $argsList = @('install', '--id', $Pkg.Winget, '-e', '--source', 'winget',
                       '--accept-package-agreements', '--accept-source-agreements',
                       '--disable-interactivity') + $Pkg.WingetArgs
-        & winget @argsList
+        & winget @argsList | Tee-Object -Variable out   # mostra ao vivo E captura a saida
         $code = $LASTEXITCODE
         if ($code -eq 0) {
             Write-Log "'$($Pkg.Name)' instalado (winget)." -Level OK
@@ -255,7 +275,9 @@ function Install-SoftwarePackage {
         }
         else {
             Write-Log "Falha/aviso ao instalar '$($Pkg.Name)' (winget). ExitCode: $code" -Level ERRO
-            Add-FeatureResult -Name $Pkg.Name -Status 'Falha' -Detail "winget ExitCode $code"
+            $tail = Get-OutputTail $out
+            if ($tail) { Write-Log "Detalhe (winget):`n$tail" -Level ERRO }
+            Add-FeatureResult -Name $Pkg.Name -Status 'Falha' -Detail (Get-ErrorDetail $out $code)
         }
     }
 }
