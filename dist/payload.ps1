@@ -192,9 +192,12 @@ function Get-FeatureStateLedger {
         $raw = Get-Content -Path $Script:StateFile -Raw -Encoding UTF8 -ErrorAction Stop
         if (-not $raw) { return @() }
         # PS 5.1: capturar em variavel antes evita o aninhamento que @(... | ConvertFrom-Json)
-        # causa com 2+ itens (a leitura virava 1 array dentro de outro).
+        # causa com 2+ itens. O loop achata 1 nivel e CURA arquivos ja aninhados por bug antigo
+        # (o proximo Save regrava achatado).
         $parsed = $raw | ConvertFrom-Json
-        return @($parsed)
+        $flat = @()
+        foreach ($p in @($parsed)) { $flat += $p }
+        return $flat
     } catch { return @() }
 }
 
