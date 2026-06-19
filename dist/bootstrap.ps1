@@ -2,7 +2,7 @@
 # ============================================================================
 #  LAUNCHER  -  ponto de entrada do 'irm | iex'
 #  GERADO por build.ps1 a partir deste template. NAO editar o dist a mao.
-#  Placeholders https://raw.githubusercontent.com/davidagostini/configuracoesv2/main/dist/bootstrap.ps1 / https://raw.githubusercontent.com/davidagostini/configuracoesv2/main/dist/payload.ps1 / 51B8409E86EE9F558D08851B7814F95364DDC859E3A554AF2CF32BBE6BD80BB2 sao
+#  Placeholders https://raw.githubusercontent.com/davidagostini/configuracoesv2/main/dist/bootstrap.ps1 / https://raw.githubusercontent.com/davidagostini/configuracoesv2/main/dist/payload.ps1 / 76F6A9E75DFB772982C6F6BDF2A936C5C49AFC1F169D268D3E0058114D6B4BFE sao
 #  substituidos no build (URLs pinadas no commit SHA).
 # ============================================================================
 $ErrorActionPreference = 'Stop'
@@ -10,7 +10,7 @@ $ErrorActionPreference = 'Stop'
 
 $SelfUrl    = 'https://raw.githubusercontent.com/davidagostini/configuracoesv2/main/dist/bootstrap.ps1'        # este launcher (re-spawn elevado)
 $PayloadUrl = 'https://raw.githubusercontent.com/davidagostini/configuracoesv2/main/dist/payload.ps1'     # payload (modulos + UI)
-$PayloadSha = '51B8409E86EE9F558D08851B7814F95364DDC859E3A554AF2CF32BBE6BD80BB2'  # SHA256 esperado do payload
+$PayloadSha = '76F6A9E75DFB772982C6F6BDF2A936C5C49AFC1F169D268D3E0058114D6B4BFE'  # SHA256 esperado do payload
 
 # --- PASSO 1: re-spawn unico = Admin + STA + Bypass -------------------------
 # Sentinela $env:WINCFG_RELAUNCHED curto-circuita as checagens no filho (anti-loop UAC).

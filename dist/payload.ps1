@@ -404,7 +404,8 @@ function Install-CapabilityServerRole {
 
     try {
         Write-Log "Instalando '$Display' (role $RoleName)..." -Level STEP
-        $r = Install-WindowsFeature -Name $RoleName -IncludeManagementTools:$IncludeManagementTools -NoRestart -ErrorAction Stop
+        # Install-WindowsFeature NAO tem -NoRestart; por padrao ja nao reinicia (so com -Restart).
+        $r = Install-WindowsFeature -Name $RoleName -IncludeManagementTools:$IncludeManagementTools -ErrorAction Stop
         if ($r.Success) {
             if ($r.RestartNeeded -ne 'No') {
                 Write-Log "'$Display' instalado - REINICIO necessario." -Level WARN
@@ -546,7 +547,8 @@ function Install-HyperVRole {
     if (-not (Test-CanInstallOrDefer -Name $name)) { return }
 
     Write-Log "Instalando Hyper-V (com ferramentas de gerenciamento)..." -Level STEP
-    $result = Install-WindowsFeature -Name Hyper-V -IncludeManagementTools -NoRestart
+    # Install-WindowsFeature NAO tem -NoRestart; por padrao ja nao reinicia (so com -Restart).
+    $result = Install-WindowsFeature -Name Hyper-V -IncludeManagementTools
 
     if ($result.Success) {
         if ($result.RestartNeeded -ne 'No') {
@@ -743,21 +745,27 @@ function Install-DhcpRoleForNat {
     if (-not ($state -and $state.Installed)) {
         if (-not (Test-CanInstallOrDefer -Name $name)) { return $false }
         Write-Log "Instalando a role DHCP (com ferramentas de gerenciamento)..." -Level STEP
-        $r = Install-WindowsFeature -Name DHCP -IncludeManagementTools -NoRestart
+        # Install-WindowsFeature NAO tem -NoRestart; por padrao ja nao reinicia (so com -Restart).
+        $r = Install-WindowsFeature -Name DHCP -IncludeManagementTools
         if (-not $r.Success) {
             Write-Log "Falha ao instalar a role DHCP. ExitCode: $($r.ExitCode)" -Level ERRO
             Add-FeatureResult -Name $name -Status 'Falha' -Detail "ExitCode $($r.ExitCode)"
             return $false
         }
-        Write-Log "Role DHCP instalada - REINICIO necessario para ativar cmdlets e servico." -Level WARN
-        Add-FeatureResult -Name $name -Status 'PrecisaReinicio' -Detail 'Reinicie e rode de novo para configurar o scope'
-        return $false
+        # O proprio cmdlet sinaliza se exige reinicio (DHCP costuma retornar SuccessRestartRequired).
+        if ($r.RestartNeeded -ne 'No') {
+            Write-Log "Role DHCP instalada - REINICIO necessario para ativar cmdlets e servico." -Level WARN
+            Add-FeatureResult -Name $name -Status 'PrecisaReinicio' -Detail 'Reinicie e rode de novo para configurar o scope'
+            return $false
+        }
+        Write-Log "Role DHCP instalada." -Level OK
     }
 
-    # Role instalada: os cmdlets de DHCP so existem apos o reinicio.
-    if (-not (Get-Command Add-DhcpServerv4Scope -ErrorAction SilentlyContinue)) {
-        Write-Log "Role DHCP presente mas os cmdlets nao estao disponiveis - reinicio pendente." -Level WARN
-        Add-FeatureResult -Name $name -Status 'PrecisaReinicio' -Detail 'Reinicie para ativar os cmdlets de DHCP'
+    # Mesmo instalada, na 1a vez os cmdlets/servico podem so subir apos o reinicio.
+    if (-not (Get-Command Add-DhcpServerv4Scope -ErrorAction SilentlyContinue) -or
+        -not (Get-Service DHCPServer -ErrorAction SilentlyContinue)) {
+        Write-Log "Role DHCP presente mas cmdlets/servico ainda nao disponiveis - reinicie e rode de novo." -Level WARN
+        Add-FeatureResult -Name $name -Status 'PrecisaReinicio' -Detail 'Reinicie para ativar os cmdlets/servico do DHCP'
         return $false
     }
 

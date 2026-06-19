@@ -138,7 +138,8 @@ function Install-CapabilityServerRole {
 
     try {
         Write-Log "Instalando '$Display' (role $RoleName)..." -Level STEP
-        $r = Install-WindowsFeature -Name $RoleName -IncludeManagementTools:$IncludeManagementTools -NoRestart -ErrorAction Stop
+        # Install-WindowsFeature NAO tem -NoRestart; por padrao ja nao reinicia (so com -Restart).
+        $r = Install-WindowsFeature -Name $RoleName -IncludeManagementTools:$IncludeManagementTools -ErrorAction Stop
         if ($r.Success) {
             if ($r.RestartNeeded -ne 'No') {
                 Write-Log "'$Display' instalado - REINICIO necessario." -Level WARN
