@@ -47,6 +47,7 @@ $Body = @(
     'modules\IIS.ps1'
     'modules\Software.ps1'
     'modules\Gui.ps1'
+    'modules\GuiWpf.ps1'
 )
 $HeadFile = 'bootstrap-head.ps1'   # template do launcher
 $TailFile = 'bootstrap-tail.ps1'   # ultima parte do payload (chama Start-InstallerUi)

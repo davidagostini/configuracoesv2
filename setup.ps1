@@ -57,8 +57,9 @@ $ModulesDir = Join-Path $PSScriptRoot 'modules'
 . (Join-Path $ModulesDir 'IIS.ps1')
 . (Join-Path $ModulesDir 'Software.ps1')
 . (Join-Path $ModulesDir 'Gui.ps1')
+. (Join-Path $ModulesDir 'GuiWpf.ps1')
 
-# --- Menu principal ---------------------------------------------------------
-# O menu vive em Gui.ps1 (Start-MainMenu) para ser compartilhado com o bundle
-# 'irm | iex', que abre exatamente este mesmo menu.
-Start-MainMenu
+# --- Entry point da UI ------------------------------------------------------
+# Start-Gui (GuiWpf.ps1) abre a janela WPF; sem WPF (Server Core/headless) cai
+# para Start-MainMenu (menu de console). Mesmo entry usado pelo bundle irm.
+Start-Gui
