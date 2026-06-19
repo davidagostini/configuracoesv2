@@ -1,0 +1,6 @@
+# Artefatos de distribuicao: bytes VERBATIM (sem conversao de fim de linha).
+# O SHA256 do payload e calculado pelo build.ps1 sobre estes bytes e assado no
+# launcher; se o git converter CRLF<->LF, a verificacao SHA256 do 'irm | iex'
+# falha (o raw.githubusercontent serve o blob como esta versionado).
+/dist/payload.ps1   -text
+/dist/bootstrap.ps1 -text
