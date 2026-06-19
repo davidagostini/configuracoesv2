@@ -1,7 +1,28 @@
 # Design verificado: lançador `irm | iex` com tela clicável (Win11 + Server)
 
-> Resultado de um workflow de design/verificação (13 agentes). Estado: **projetado e
-> verificado, ainda NÃO implementado**. Este doc é o plano de implementação da próxima fase.
+> Resultado de um workflow de design/verificação (13 agentes). Estado: **IMPLEMENTADO**
+> (fases A–D). Abaixo o plano original; ao final, as divergências adotadas na implementação.
+
+## Estado da implementação (atualizado)
+
+- **Fase A** — base: `Common.ps1` (`Set-LogDirectory`, log absoluto, `-Source`/`-LimitAccess`),
+  `setup.ps1` (elevação robusta), `build.ps1`. **Feito.**
+- **Fase B** — `OSCommon.ps1`: `$Script:CapabilityCatalog`, `Install-Capability`,
+  `Install-CapabilityServerRole`, `Get-AvailableCapabilities`, `Invoke-CapabilityInstall`. **Feito.**
+- **Fase C** — `modules/Gui.ps1`: `Show-InstallerGui`, `Show-InstallerConsole`, `Start-InstallerUi`,
+  `Get-SummaryText`. Ligado ao `setup.ps1` (opção 9). **Feito.**
+- **Fase D** — `bootstrap-head.ps1` (launcher) + `bootstrap-tail.ps1` + `build.ps1` em 2 artefatos. **Feito.**
+
+### Divergências adotadas (decisões de implementação)
+
+1. **Launcher + payload (2 arquivos), não bundle único.** Para a verificação SHA256 proteger
+   o que executa (sem circularidade do hash-de-si-mesmo): `dist/bootstrap.ps1` é um launcher
+   pequeno que faz re-spawn e baixa `dist/payload.ps1` (módulos+UI), confere o SHA256 **baked**
+   e só então `iex`. `build.ps1` gera os dois; a pinagem usa `-Ref <commitSHA>`.
+2. **GUI faz seleção; instalação roda no console + resumo em MessageBox.** Em vez de runspace de
+   background (frágil sob `irm|iex`/5.1), a tela coleta o que instalar + pasta de log, fecha, e a
+   instalação roda no console com log ao vivo; ao fim, `MessageBox` com o resumo categorizado.
+3. **`dist/` versiona só os 3 artefatos publicados** (`bootstrap.ps1`, `payload.ps1`, `.sha256`).
 
 ## 1. Visão geral
 

@@ -56,6 +56,7 @@ $ModulesDir = Join-Path $PSScriptRoot 'modules'
 . (Join-Path $ModulesDir 'BaseConfig.ps1')
 . (Join-Path $ModulesDir 'IIS.ps1')
 . (Join-Path $ModulesDir 'Software.ps1')
+. (Join-Path $ModulesDir 'Gui.ps1')
 
 # --- Menu -------------------------------------------------------------------
 function Show-Menu {
@@ -70,11 +71,14 @@ function Show-Menu {
     Write-Host "    3) Mostrar extensoes de arquivos"
     Write-Host "    4) Mostrar arquivos ocultos"
     Write-Host ""
-    Write-Host "  OUTRAS AREAS (em construcao)"
-    Write-Host "    5) IIS / Servidor Web                 [a implementar]"
-    Write-Host "    6) Funcoes/Recursos do Windows        [a implementar]"
-    Write-Host "    7) Softwares / Runtimes               [a implementar]"
-    Write-Host "    8) Hardening / Config. base           [a implementar]"
+    Write-Host "  OUTRAS AREAS"
+    Write-Host "    5) IIS / Servidor Web"
+    Write-Host "    6) Funcoes/Recursos do Windows"
+    Write-Host "    7) Softwares / Runtimes"
+    Write-Host "    8) Config. base"
+    Write-Host ""
+    Write-Host "  INSTALACAO RAPIDA"
+    Write-Host "    9) Tela de capacidades (GUI ou console)"
     Write-Host ""
     Write-Host "    0) Sair"
     Write-Host ""
@@ -94,6 +98,7 @@ do {
         '6' { Invoke-FeaturesMenu }
         '7' { Invoke-SoftwareMenu }
         '8' { Invoke-BaseConfigMenu }
+        '9' { Start-InstallerUi }
         '0' { Write-Log "Saindo." -Level INFO }
         default { Write-Host "Opcao invalida." -ForegroundColor Red }
     }

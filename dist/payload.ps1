@@ -1,0 +1,1444 @@
+#Requires -Version 5.1
+# === PAYLOAD GERADO POR build.ps1 - NAO EDITAR A MAO ===
+# Fonte: modules\*.ps1 + bootstrap-tail.ps1. Para alterar, edite as fontes e rode build.ps1.
+
+# ===== INICIO modules\Common.ps1 =====
+# ============================================================================
+#  Common.ps1  -  Funcoes compartilhadas usadas por todos os modulos
+#  Carregado (dot-sourced) pelo setup.ps1. Nao executar diretamente.
+# ============================================================================
+
+# --- Logging ---------------------------------------------------------------
+
+# Pasta de log padrao do projeto (decisao do usuario). Usada quando rodando
+# via 'irm | iex' (sem disco/$PSScriptRoot) ou quando o usuario nao define outra.
+$Script:DefaultLogDir = 'C:\davidagostini\instalador\log'
+
+# Resolve a pasta de log inicial:
+#  - se $PSScriptRoot existe (dev local com modulos no disco) -> ..\logs
+#  - senao (irm|iex, bundle em memoria)                       -> pasta padrao
+if ($PSScriptRoot) {
+    $Script:LogFile = Join-Path $PSScriptRoot '..\logs\install.log'
+} else {
+    $Script:LogFile = Join-Path $Script:DefaultLogDir 'install.log'
+}
+
+# Define a pasta onde os logs serao gravados (campo "Pasta de log" da tela).
+# Gera um arquivo por execucao com timestamp passado pelo chamador, ou o
+# install.log padrao quando -FileName nao e informado.
+function Set-LogDirectory {
+    param(
+        [Parameter(Mandatory)] [string] $Path,
+        [string] $FileName = 'install.log'
+    )
+    if (-not $Path) { return }
+    if (-not (Test-Path $Path)) {
+        New-Item -ItemType Directory -Path $Path -Force | Out-Null
+    }
+    $Script:LogFile = Join-Path $Path $FileName
+    Write-Log "Pasta de log definida: $Path" -Level INFO
+}
+
+function Write-Log {
+    param(
+        [Parameter(Mandatory)] [string] $Message,
+        [ValidateSet('INFO', 'OK', 'WARN', 'ERRO', 'STEP')] [string] $Level = 'INFO'
+    )
+
+    $stamp  = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    $line   = "[$stamp] [$Level] $Message"
+
+    # Garante a pasta de logs
+    $logDir = Split-Path $Script:LogFile -Parent
+    if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+    Add-Content -Path $Script:LogFile -Value $line -Encoding UTF8
+
+    $color = switch ($Level) {
+        'OK'   { 'Green' }
+        'WARN' { 'Yellow' }
+        'ERRO' { 'Red' }
+        'STEP' { 'Cyan' }
+        default { 'Gray' }
+    }
+    $prefix = switch ($Level) {
+        'OK'   { '  [OK]  ' }
+        'WARN' { '  [!]   ' }
+        'ERRO' { '  [X]   ' }
+        'STEP' { '==> ' }
+        default { '  -    ' }
+    }
+    Write-Host "$prefix$Message" -ForegroundColor $color
+}
+
+# --- Verificacao de privilegios -------------------------------------------
+
+function Test-IsAdmin {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $pr = New-Object Security.Principal.WindowsPrincipal($id)
+    return $pr.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# --- Helpers de Registro (idempotentes) -----------------------------------
+
+# Define um valor de registro, criando a chave se necessario.
+# Retorna $true se mudou algo, $false se ja estava no valor desejado.
+function Set-RegistryValue {
+    param(
+        [Parameter(Mandatory)] [string] $Path,
+        [Parameter(Mandatory)] [string] $Name,
+        [Parameter(Mandatory)] $Value,
+        [ValidateSet('String', 'ExpandString', 'Binary', 'DWord', 'MultiString', 'QWord')]
+        [string] $Type = 'DWord'
+    )
+
+    if (-not (Test-Path $Path)) {
+        New-Item -Path $Path -Force | Out-Null
+        Write-Log "Criada chave de registro: $Path" -Level INFO
+    }
+
+    $current = (Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue).$Name
+
+    if ($null -ne $current -and $current -eq $Value) {
+        Write-Log "Registro ja configurado: $Name = $Value" -Level OK
+        return $false
+    }
+
+    New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType $Type -Force | Out-Null
+    Write-Log "Registro definido: $Name = $Value" -Level OK
+    return $true
+}
+
+# --- Confirmacao do usuario -------------------------------------------------
+
+function Confirm-Action {
+    param([string] $Message = 'Deseja continuar?')
+    $resp = Read-Host "$Message [S/N]"
+    return ($resp -match '^[SsYy]')
+}
+
+# ============================================================================
+#  Controle de reinicio e resultados (compartilhado por Features e IIS)
+# ============================================================================
+
+# Lista acumulada de resultados da sessao: PSCustomObject Name/Status/Detail.
+# $Script: aqui = escopo do setup.ps1 (todos os modulos dot-sourced compartilham).
+$Script:FeatureResults = @()
+
+function Reset-FeatureSession {
+    $Script:FeatureResults = @()
+}
+
+function Add-FeatureResult {
+    param(
+        [Parameter(Mandatory)] [string] $Name,
+        [Parameter(Mandatory)] [ValidateSet('Instalado','PrecisaReinicio','Deferido','JaPresente','Falha')] [string] $Status,
+        [string] $Detail = ''
+    )
+    $Script:FeatureResults += [PSCustomObject]@{ Name = $Name; Status = $Status; Detail = $Detail }
+}
+
+# Detecta reinicio pendente por varias fontes conhecidas do Windows.
+function Test-PendingReboot {
+    $paths = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+    )
+    foreach ($p in $paths) { if (Test-Path $p) { return $true } }
+
+    $pfro = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' `
+                             -Name 'PendingFileRenameOperations' -ErrorAction SilentlyContinue
+    if ($pfro) { return $true }
+
+    return $false
+}
+
+# Guarda de entrada: se ha reinicio pendente, defere o componente e retorna $false.
+function Test-CanInstallOrDefer {
+    param([Parameter(Mandatory)] [string] $Name)
+
+    if (Test-PendingReboot) {
+        Write-Log "'$Name' NAO sera instalado agora: ha reinicio pendente." -Level WARN
+        Write-Log "Reinicie o servidor e rode o setup novamente para instalar '$Name'." -Level WARN
+        Add-FeatureResult -Name $Name -Status 'Deferido' -Detail 'Reinicio pendente antes da instalacao'
+        return $false
+    }
+    return $true
+}
+
+# Habilita uma Feature opcional (DISM/Enable-WindowsOptionalFeature) com:
+#  - checagem de "ja habilitada"
+#  - guarda de reinicio pendente (defere)
+#  - -NoRestart sempre
+#  - deteccao de reinicio exigido pela propria feature
+#  - registro do resultado
+function Enable-OptionalFeatureSafe {
+    param(
+        [Parameter(Mandatory)] [string] $FeatureName,
+        [string] $DisplayName,
+        [switch] $All,
+        # NetFx3 e WCF non-45 sao FoD sem payload local: se a feature exigir e
+        # WU/WSUS estiver bloqueado, pode-se apontar -Source para a midia do
+        # Windows (ex.: D:\sources\sxs) com -LimitAccess. Sem -Source, tenta online.
+        [string] $Source,
+        [switch] $LimitAccess
+    )
+    if (-not $DisplayName) { $DisplayName = $FeatureName }
+
+    $f = Get-WindowsOptionalFeature -Online -FeatureName $FeatureName -ErrorAction SilentlyContinue
+    if (-not $f) {
+        Write-Log "Feature '$FeatureName' nao existe neste SO - ignorando." -Level WARN
+        Add-FeatureResult -Name $DisplayName -Status 'Falha' -Detail 'Feature inexistente neste SO'
+        return
+    }
+    if ($f.State -eq 'Enabled') {
+        Write-Log "'$DisplayName' ja esta habilitada." -Level OK
+        Add-FeatureResult -Name $DisplayName -Status 'JaPresente'
+        return
+    }
+
+    if (-not (Test-CanInstallOrDefer -Name $DisplayName)) { return }
+
+    try {
+        Write-Log "Habilitando '$DisplayName' ($FeatureName)..." -Level STEP
+        $eparams = @{
+            Online      = $true
+            FeatureName = $FeatureName
+            All         = $All
+            NoRestart   = $true
+            ErrorAction = 'Stop'
+        }
+        if ($Source)      { $eparams['Source']      = $Source }
+        if ($LimitAccess) { $eparams['LimitAccess'] = $true }
+        $r = Enable-WindowsOptionalFeature @eparams
+        if ($r.RestartNeeded) {
+            Write-Log "'$DisplayName' habilitada - REINICIO necessario para concluir." -Level WARN
+            Add-FeatureResult -Name $DisplayName -Status 'PrecisaReinicio'
+        } else {
+            Write-Log "'$DisplayName' habilitada." -Level OK
+            Add-FeatureResult -Name $DisplayName -Status 'Instalado'
+        }
+    }
+    catch {
+        $msg = $_.Exception.Message
+        Write-Log "Falha ao habilitar '$DisplayName': $msg" -Level ERRO
+        # 0x800F0954 / 0x800F081F: payload (FoD/NetFx3) ausente e WU/WSUS bloqueado.
+        if ($msg -match '0x800F0954|0x800F081F|0x800f0906') {
+            Write-Log "Dica: '$DisplayName' precisa do payload do Windows. Rode com a midia de instalacao: -Source <unidade>\sources\sxs -LimitAccess" -Level WARN
+        }
+        Add-FeatureResult -Name $DisplayName -Status 'Falha' -Detail $msg
+    }
+}
+
+# Resumo categorizado da sessao (instalados / reinicio / deferidos / falhas).
+function Show-FeaturesSummary {
+    if ($Script:FeatureResults.Count -eq 0) { return }
+
+    Write-Host ""
+    Write-Host "  ============== RESUMO DA SESSAO ==============" -ForegroundColor Cyan
+
+    $ok       = $Script:FeatureResults | Where-Object Status -in 'Instalado','JaPresente'
+    $reboot   = $Script:FeatureResults | Where-Object Status -eq 'PrecisaReinicio'
+    $deferred = $Script:FeatureResults | Where-Object Status -eq 'Deferido'
+    $failed   = $Script:FeatureResults | Where-Object Status -eq 'Falha'
+
+    if ($ok)       { Write-Host "  [OK] Instalados / ja presentes:" -ForegroundColor Green
+                     $ok | ForEach-Object { Write-Host "       - $($_.Name)" -ForegroundColor Green } }
+
+    if ($reboot)   { Write-Host "  [!] Precisam de REINICIO para concluir:" -ForegroundColor Yellow
+                     $reboot | ForEach-Object { Write-Host "       - $($_.Name)" -ForegroundColor Yellow } }
+
+    if ($deferred) { Write-Host "  [>] NAO instalados (aguardando reinicio pendente):" -ForegroundColor Magenta
+                     $deferred | ForEach-Object { Write-Host "       - $($_.Name)" -ForegroundColor Magenta }
+                     Write-Host "       => Reinicie o servidor e rode o setup novamente." -ForegroundColor Magenta }
+
+    if ($failed)   { Write-Host "  [X] Falhas:" -ForegroundColor Red
+                     $failed | ForEach-Object { Write-Host "       - $($_.Name)  ($($_.Detail))" -ForegroundColor Red } }
+
+    if ($reboot -or $deferred) {
+        Write-Host ""
+        Write-Host "  Reinicie manualmente quando puder:  Restart-Computer" -ForegroundColor Yellow
+    }
+    Write-Host "  ==============================================" -ForegroundColor Cyan
+    Write-Host ""
+}
+# ===== FIM modules\Common.ps1 =====
+
+# ===== INICIO modules\OSCommon.ps1 =====
+# ============================================================================
+#  OSCommon.ps1  -  Deteccao de SO (client vs server) e capacidade de GUI
+#  Depende do Common.ps1. Base para o dispatch por capacidade e para a tela
+#  hibrida (GUI/console) do lancador via 'irm | iex' (ver docs/DESIGN-irm-gui.md).
+# ============================================================================
+
+# Deteccao cacheada. Regras (verificadas pelo workflow de design):
+#  - SKU por ProductType -ne 1 (1=client/workstation, 2=DC, 3=server).
+#    Usar -ne 1 (nao -eq 3) para nao tratar um Domain Controller como nao-servidor.
+#  - API de feature por CAPACIDADE, nao por nome: se o modulo ServerManager existe
+#    (Install-WindowsFeature) e Server; senao usa Enable-WindowsOptionalFeature.
+#  - GUI: Server Core nunca; senao exige WinForms carregavel + sessao interativa.
+function Get-OSRole {
+    if ($Script:OSRole) { return $Script:OSRole }
+
+    $os = Get-CimInstance Win32_OperatingSystem
+    $cv = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+    $it = (Get-ItemProperty $cv -Name InstallationType -ErrorAction SilentlyContinue).InstallationType  # Client | Server | Server Core
+
+    $isServer     = $os.ProductType -ne 1
+    $isCore       = $it -eq 'Server Core'
+    $hasServerMgr = [bool](Get-Module -ListAvailable -Name ServerManager)
+
+    $canGui = $false
+    if (-not $isCore -and [Environment]::UserInteractive) {
+        try {
+            Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+            Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+            $canGui = $true
+        } catch { $canGui = $false }
+    }
+
+    $Script:OSRole = [PSCustomObject]@{
+        Sku              = if ($isServer) { 'Server' } else { 'Client' }
+        ProductType      = $os.ProductType
+        InstallationType = $it
+        IsServer         = $isServer
+        IsServerCore     = $isCore
+        HasServerManager = $hasServerMgr
+        CanUseGui        = $canGui
+        Caption          = $os.Caption
+    }
+    return $Script:OSRole
+}
+
+# ============================================================================
+#  Catalogo de capacidades + dispatch por capacidade (nao por nome de SO)
+#  Ver docs/DESIGN-irm-gui.md secao 3. Das ~10 capacidades, so HyperV e
+#  Containers BIFURCAM (Install-WindowsFeature no Server vs DISM no Client);
+#  as demais usam os mesmos ids DISM nos dois SOs. Sandbox e client-only.
+# ============================================================================
+
+# AvailableOn: 'Both' | 'ClientOnly' | 'ServerOnly'.
+# ServerRole != '' => quando ha ServerManager, instala via Install-WindowsFeature
+#   com esse nome de role; senao cai no caminho DISM (Features).
+# NeedsSource => FoD sem payload local (NetFx3): aceita -Source/-LimitAccess.
+function New-Capability {
+    param(
+        $Id, $Display, $Category, $AvailableOn = 'Both',
+        $Features = @(), $ServerRole = '',
+        [switch] $IncludeManagementTools, [switch] $NeedsSource, $Notes = ''
+    )
+    [PSCustomObject]@{
+        Id          = $Id; Display = $Display; Category = $Category
+        AvailableOn = $AvailableOn; Features = @($Features); ServerRole = $ServerRole
+        IncludeManagementTools = [bool]$IncludeManagementTools
+        NeedsSource = [bool]$NeedsSource; Notes = $Notes
+    }
+}
+
+$Script:CapabilityCatalog = @(
+    (New-Capability 'HyperV'        'Hyper-V'                         'Virtualizacao' 'Both'       @('Microsoft-Hyper-V-All') 'Hyper-V' -IncludeManagementTools -Notes 'Requer reinicio')
+    (New-Capability 'Containers'    'Containers'                     'Virtualizacao' 'Both'       @('Containers') 'Containers')
+    (New-Capability 'Sandbox'       'Windows Sandbox'                'Virtualizacao' 'ClientOnly' @('Containers-DisposableClientVM'))
+    (New-Capability 'Telnet'        'Telnet Client'                  'Rede'          'Both'       @('TelnetClient'))
+    (New-Capability 'IISCore'       'IIS - Servidor Web'             'Web/IIS'       'Both'       @('IIS-WebServerRole','IIS-WebServer'))
+    (New-Capability 'IISAspNet'     'IIS - ASP.NET 4.x'              'Web/IIS'       'Both'       @('IIS-ASPNET45'))
+    (New-Capability 'IISMgmt'       'IIS - Console de Gerenciamento' 'Web/IIS'       'Both'       @('IIS-ManagementConsole','IIS-ManagementScriptingTools','IIS-ManagementService'))
+    (New-Capability 'NetFx3'        '.NET Framework 3.5'             '.NET'          'Both'       @('NetFx3') '' -NeedsSource -Notes 'Payload via WU/online; -Source aponta a midia')
+    (New-Capability 'WAS'           'Windows Process Activation'     '.NET'          'Both'       @('WAS-WindowsActivationService','WAS-ProcessModel','WAS-NetFxEnvironment','WAS-ConfigurationAPI'))
+    (New-Capability 'WCFActivation' 'WCF Activation (4.x)'           '.NET'          'Both'       @('WCF-HTTP-Activation45','WCF-MSMQ-Activation45','WCF-Pipe-Activation45','WCF-TCP-Activation45') '' -Notes 'WCF non-45 pertence a subarvore do NetFx3 (ver Install-IISFull)')
+    (New-Capability 'MSMQ'          'MSMQ'                           'Mensageria'    'Both'       @('MSMQ-Server'))
+)
+
+# Lista as capacidades validas para o SO atual (filtra Sandbox no Server etc).
+function Get-AvailableCapabilities {
+    $role = Get-OSRole
+    $Script:CapabilityCatalog | Where-Object {
+        switch ($_.AvailableOn) {
+            'ClientOnly' { -not $role.IsServer }
+            'ServerOnly' { $role.IsServer }
+            default      { $true }
+        }
+    }
+}
+
+# Instala UMA capacidade do catalogo, decidindo a API em runtime.
+function Install-Capability {
+    param(
+        [Parameter(Mandatory)] $Capability,
+        [string] $Source   # midia opcional p/ NetFx3 (FoD)
+    )
+    $role = Get-OSRole
+
+    # Bifurcacao: role de Server quando ha ServerManager (Hyper-V, Containers).
+    if ($Capability.ServerRole -and $role.HasServerManager) {
+        Install-CapabilityServerRole -RoleName $Capability.ServerRole `
+            -Display $Capability.Display -IncludeManagementTools:$Capability.IncludeManagementTools
+        return
+    }
+
+    # Caminho DISM: client, e tambem server p/ as features cross-OS.
+    foreach ($f in $Capability.Features) {
+        $dn = if ($Capability.Features.Count -eq 1) { $Capability.Display } else { $f }
+        if ($Capability.NeedsSource -and $Source) {
+            Enable-OptionalFeatureSafe -FeatureName $f -DisplayName $dn -All -Source $Source -LimitAccess
+        } else {
+            Enable-OptionalFeatureSafe -FeatureName $f -DisplayName $dn -All
+        }
+    }
+}
+
+# Instala uma role de Server (Install-WindowsFeature) com as mesmas garantias
+# do motor: ja-presente, defere em reinicio pendente, -NoRestart, registro.
+function Install-CapabilityServerRole {
+    param(
+        [Parameter(Mandatory)] [string] $RoleName,
+        [Parameter(Mandatory)] [string] $Display,
+        [switch] $IncludeManagementTools
+    )
+    $state = Get-WindowsFeature -Name $RoleName -ErrorAction SilentlyContinue
+    if ($state -and $state.Installed) {
+        Write-Log "'$Display' ja instalado." -Level OK
+        Add-FeatureResult -Name $Display -Status 'JaPresente'
+        return
+    }
+    if (-not (Test-CanInstallOrDefer -Name $Display)) { return }
+
+    try {
+        Write-Log "Instalando '$Display' (role $RoleName)..." -Level STEP
+        $r = Install-WindowsFeature -Name $RoleName -IncludeManagementTools:$IncludeManagementTools -NoRestart -ErrorAction Stop
+        if ($r.Success) {
+            if ($r.RestartNeeded -ne 'No') {
+                Write-Log "'$Display' instalado - REINICIO necessario." -Level WARN
+                Add-FeatureResult -Name $Display -Status 'PrecisaReinicio'
+            } else {
+                Write-Log "'$Display' instalado." -Level OK
+                Add-FeatureResult -Name $Display -Status 'Instalado'
+            }
+        } else {
+            Write-Log "Falha ao instalar '$Display'. ExitCode: $($r.ExitCode)" -Level ERRO
+            Add-FeatureResult -Name $Display -Status 'Falha' -Detail "ExitCode $($r.ExitCode)"
+        }
+    }
+    catch {
+        Write-Log "Falha ao instalar '$Display': $($_.Exception.Message)" -Level ERRO
+        Add-FeatureResult -Name $Display -Status 'Falha' -Detail $_.Exception.Message
+    }
+}
+
+# Instala um conjunto de capacidades por Id. Ordena NetFx3 antes de WCF
+# (WCF non-45 herda do NetFx3) e abre/fecha a sessao de resumo.
+function Invoke-CapabilityInstall {
+    param(
+        [Parameter(Mandatory)] [string[]] $Ids,
+        [string] $Source
+    )
+    Reset-FeatureSession
+
+    $selected = $Script:CapabilityCatalog | Where-Object { $Ids -contains $_.Id }
+    $sorted = $selected | Sort-Object {
+        switch ($_.Id) { 'NetFx3' { 0 } 'WCFActivation' { 2 } default { 1 } }
+    }
+    foreach ($cap in $sorted) {
+        Install-Capability -Capability $cap -Source $Source
+    }
+
+    Show-FeaturesSummary
+}
+# ===== FIM modules\OSCommon.ps1 =====
+
+# ===== INICIO modules\Customizations.ps1 =====
+# ============================================================================
+#  Customizations.ps1  -  Ajustes de interface / Explorer para o usuario atual
+#  Funcoes chamadas pelo setup.ps1. Dependem do Common.ps1 (Write-Log etc).
+# ============================================================================
+
+$Script:ExplorerAdvanced = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
+$Script:Personalize      = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize'
+
+# Reinicia o explorer.exe para aplicar mudancas de UI (so quando necessario).
+function Restart-Explorer {
+    Write-Log "Reiniciando o Explorer para aplicar as mudancas..." -Level STEP
+    Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 1
+    if (-not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) {
+        Start-Process explorer.exe
+    }
+    Write-Log "Explorer reiniciado." -Level OK
+}
+
+# --- Dark Mode (tema escuro para apps e sistema) ---------------------------
+function Enable-DarkMode {
+    Write-Log "Ativando Dark Mode (apps e sistema)..." -Level STEP
+    $c1 = Set-RegistryValue -Path $Script:Personalize -Name 'AppsUseLightTheme'   -Value 0 -Type DWord
+    $c2 = Set-RegistryValue -Path $Script:Personalize -Name 'SystemUsesLightTheme' -Value 0 -Type DWord
+    return ($c1 -or $c2)
+}
+
+# --- Mostrar extensoes de arquivos conhecidos ------------------------------
+function Show-FileExtensions {
+    Write-Log "Habilitando exibicao das extensoes de arquivo..." -Level STEP
+    # HideFileExt = 0  => mostra as extensoes
+    return (Set-RegistryValue -Path $Script:ExplorerAdvanced -Name 'HideFileExt' -Value 0 -Type DWord)
+}
+
+# --- Mostrar arquivos e pastas ocultos -------------------------------------
+function Show-HiddenFiles {
+    param([switch] $IncludeProtectedOsFiles)
+    Write-Log "Habilitando exibicao de arquivos ocultos..." -Level STEP
+    # Hidden = 1 => mostra ocultos ; 2 => nao mostra
+    $changed = Set-RegistryValue -Path $Script:ExplorerAdvanced -Name 'Hidden' -Value 1 -Type DWord
+
+    if ($IncludeProtectedOsFiles) {
+        Write-Log "Habilitando arquivos protegidos do sistema (ShowSuperHidden)..." -Level STEP
+        $c2 = Set-RegistryValue -Path $Script:ExplorerAdvanced -Name 'ShowSuperHidden' -Value 1 -Type DWord
+        $changed = $changed -or $c2
+    }
+    return $changed
+}
+
+# --- Aplica todas as customizacoes de uma vez ------------------------------
+function Invoke-AllCustomizations {
+    $changed = $false
+    if (Enable-DarkMode)        { $changed = $true }
+    if (Show-FileExtensions)    { $changed = $true }
+    if (Show-HiddenFiles)       { $changed = $true }
+
+    if ($changed) {
+        Restart-Explorer
+    } else {
+        Write-Log "Nenhuma mudanca necessaria - tudo ja estava configurado." -Level OK
+    }
+}
+# ===== FIM modules\Customizations.ps1 =====
+
+# ===== INICIO modules\WindowsFeatures.ps1 =====
+# ============================================================================
+#  WindowsFeatures.ps1  -  Roles e Features do Windows
+#  Funcoes chamadas pelo setup.ps1. Dependem do Common.ps1.
+#
+#  REGRAS DE SEGURANCA (ver Common.ps1):
+#   1. Nunca reinicia automaticamente (sempre -NoRestart).
+#   2. ANTES de instalar checa reinicio pendente -> defere se houver.
+#   3. DEPOIS detecta se a instalacao exige reinicio.
+#   4. Resumo final via Show-FeaturesSummary.
+# ============================================================================
+
+# --- Hyper-V (Role) - REQUER REINICIO --------------------------------------
+# OS-aware: no Windows 11 (sem ServerManager) usa Enable-WindowsOptionalFeature
+# com o feature 'Microsoft-Hyper-V-All'; no Windows Server usa Install-WindowsFeature.
+function Install-HyperVRole {
+    $name = 'Hyper-V'
+    Write-Log "Verificando a role Hyper-V..." -Level STEP
+
+    # Windows client (Win11 Pro/Ent/Edu): caminho DISM. Install-WindowsFeature nao existe aqui.
+    if (-not (Get-OSRole).HasServerManager) {
+        Write-Log "SO client detectado - usando Enable-WindowsOptionalFeature (Microsoft-Hyper-V-All)." -Level INFO
+        Enable-OptionalFeatureSafe -FeatureName 'Microsoft-Hyper-V-All' -DisplayName 'Hyper-V' -All
+        return
+    }
+
+    $state = Get-WindowsFeature -Name Hyper-V -ErrorAction SilentlyContinue
+    if ($state -and $state.Installed) {
+        Write-Log "Hyper-V ja esta instalado." -Level OK
+        Add-FeatureResult -Name $name -Status 'JaPresente'
+        return
+    }
+
+    if (-not (Test-CanInstallOrDefer -Name $name)) { return }
+
+    Write-Log "Instalando Hyper-V (com ferramentas de gerenciamento)..." -Level STEP
+    $result = Install-WindowsFeature -Name Hyper-V -IncludeManagementTools -NoRestart
+
+    if ($result.Success) {
+        if ($result.RestartNeeded -ne 'No') {
+            Write-Log "Hyper-V instalado - REINICIO necessario para concluir." -Level WARN
+            Add-FeatureResult -Name $name -Status 'PrecisaReinicio' -Detail 'Concluir instalacao do Hyper-V'
+        } else {
+            Write-Log "Hyper-V instalado." -Level OK
+            Add-FeatureResult -Name $name -Status 'Instalado'
+        }
+    } else {
+        Write-Log "Falha ao instalar o Hyper-V. ExitCode: $($result.ExitCode)" -Level ERRO
+        Add-FeatureResult -Name $name -Status 'Falha' -Detail "ExitCode $($result.ExitCode)"
+    }
+}
+
+# --- Telnet Client ----------------------------------------------------------
+function Enable-TelnetClientFeature {
+    Enable-OptionalFeatureSafe -FeatureName 'TelnetClient' -DisplayName 'Telnet Client'
+}
+
+# --- NAT Switch (Hyper-V) ---------------------------------------------------
+# Cria: (1) switch virtual Interno, (2) IP de gateway na vEthernet do switch,
+# (3) NAT na sub-rede. Nome, sub-rede (CIDR) e gateway sao informados pelo
+# usuario (NAO fixos). Idempotente: nao recria o que ja existe. Nao reinicia.
+function New-NatSwitch {
+    param(
+        [Parameter(Mandatory)] [string] $SwitchName,   # ex.: NATSwitch
+        [Parameter(Mandatory)] [string] $Subnet,       # ex.: 172.16.3.0/24 (CIDR)
+        [Parameter(Mandatory)] [string] $GatewayIP,    # ex.: 172.16.3.1
+        [string] $NatName                              # ENTER = "<SwitchName>-NAT"
+    )
+    if (-not $NatName) { $NatName = "$SwitchName-NAT" }
+    $display = "NAT Switch '$SwitchName'"
+    Write-Log "Configurando $display ($Subnet, gateway $GatewayIP)..." -Level STEP
+
+    # Hyper-V precisa estar disponivel (New-VMSwitch vem do modulo Hyper-V).
+    if (-not (Get-Command New-VMSwitch -ErrorAction SilentlyContinue)) {
+        Write-Log "Cmdlets de Hyper-V indisponiveis. Instale o Hyper-V (e reinicie) antes." -Level ERRO
+        Add-FeatureResult -Name $display -Status 'Falha' -Detail 'Hyper-V / New-VMSwitch ausente'
+        return
+    }
+
+    # Deriva o PrefixLength da sub-rede em CIDR (nao fixa em /24).
+    if ($Subnet -notmatch '^\s*\d{1,3}(\.\d{1,3}){3}\s*/\s*(\d{1,2})\s*$') {
+        Write-Log "Sub-rede invalida: '$Subnet'. Use CIDR, ex.: 172.16.3.0/24" -Level ERRO
+        Add-FeatureResult -Name $display -Status 'Falha' -Detail 'CIDR invalido'
+        return
+    }
+    $prefixLen = [int]$Matches[2]
+    $ifAlias   = "vEthernet ($SwitchName)"
+
+    try {
+        # 1) Switch virtual interno
+        if (Get-VMSwitch -Name $SwitchName -ErrorAction SilentlyContinue) {
+            Write-Log "Switch '$SwitchName' ja existe - mantido." -Level OK
+        } else {
+            New-VMSwitch -SwitchName $SwitchName -SwitchType Internal -ErrorAction Stop | Out-Null
+            Write-Log "Switch interno '$SwitchName' criado." -Level OK
+        }
+
+        # 2) IP de gateway na interface vEthernet do switch
+        $hasIp = Get-NetIPAddress -InterfaceAlias $ifAlias -IPAddress $GatewayIP -ErrorAction SilentlyContinue
+        if ($hasIp) {
+            Write-Log "IP $GatewayIP ja atribuido a '$ifAlias' - mantido." -Level OK
+        } else {
+            New-NetIPAddress -IPAddress $GatewayIP -PrefixLength $prefixLen -InterfaceAlias $ifAlias -ErrorAction Stop | Out-Null
+            Write-Log "IP $GatewayIP/$prefixLen atribuido a '$ifAlias'." -Level OK
+        }
+
+        # 3) NAT na sub-rede
+        if (Get-NetNat -Name $NatName -ErrorAction SilentlyContinue) {
+            Write-Log "NAT '$NatName' ja existe - mantido." -Level OK
+        } else {
+            New-NetNat -Name $NatName -InternalIPInterfaceAddressPrefix $Subnet -ErrorAction Stop | Out-Null
+            Write-Log "NAT '$NatName' criado para $Subnet." -Level OK
+        }
+
+        Add-FeatureResult -Name $display -Status 'Instalado' -Detail "$Subnet / gw $GatewayIP / nat $NatName"
+    }
+    catch {
+        Write-Log "Falha ao configurar ${display}: $($_.Exception.Message)" -Level ERRO
+        Add-FeatureResult -Name $display -Status 'Falha' -Detail $_.Exception.Message
+    }
+}
+
+# Prompt interativo: pergunta nome / sub-rede / gateway (nada fixo).
+function Invoke-NatSwitchPrompt {
+    Write-Host ""
+    Write-Host "  --- Criar NAT Switch (Hyper-V) ---" -ForegroundColor Cyan
+    # Nome tem default NATSwitch (ENTER aceita). IP/sub-rede vem como exemplo.
+    $name = (Read-Host "Nome do switch (ENTER = NATSwitch)").Trim()
+    if (-not $name) { $name = 'NATSwitch' }
+
+    $subnet = (Read-Host "Sub-rede em CIDR (ex.: 172.16.99.0/24)").Trim()
+    if (-not $subnet) { Write-Host "Sub-rede obrigatoria. Cancelado." -ForegroundColor Yellow; return }
+
+    $gw = (Read-Host "IP do gateway (ex.: 172.16.99.1)").Trim()
+    if (-not $gw) { Write-Host "Gateway obrigatorio. Cancelado." -ForegroundColor Yellow; return }
+
+    $nat = (Read-Host "Nome da rede NAT (ENTER = $name-NAT)").Trim()
+    if ($nat) { New-NatSwitch -SwitchName $name -Subnet $subnet -GatewayIP $gw -NatName $nat }
+    else      { New-NatSwitch -SwitchName $name -Subnet $subnet -GatewayIP $gw }
+}
+
+# --- Submenu de Features ----------------------------------------------------
+function Invoke-FeaturesMenu {
+    Reset-FeatureSession
+
+    if (Test-PendingReboot) {
+        Write-Log "AVISO: ja existe um reinicio pendente neste servidor." -Level WARN
+        Write-Log "Novas instalacoes serao DEFERIDAS ate o reinicio. Reinicie antes de continuar." -Level WARN
+    }
+
+    do {
+        Write-Host ""
+        Write-Host "  --- Funcoes / Recursos do Windows ---" -ForegroundColor Cyan
+        Write-Host "    1) Instalar Hyper-V            [REQUER REINICIO]"
+        Write-Host "    2) Habilitar Telnet Client"
+        Write-Host "    3) Criar NAT Switch (Hyper-V)  [nome/sub-rede/gateway]"
+        Write-Host "    9) Ver resumo da sessao"
+        Write-Host "    0) Voltar (mostra resumo)"
+        Write-Host ""
+        $o = Read-Host "Escolha"
+
+        switch ($o) {
+            '1' { Install-HyperVRole }
+            '2' { Enable-TelnetClientFeature }
+            '3' { Invoke-NatSwitchPrompt }
+            '9' { Show-FeaturesSummary }
+            '0' { }
+            default { Write-Host "Opcao invalida." -ForegroundColor Red }
+        }
+    } while ($o -ne '0')
+
+    Show-FeaturesSummary
+}
+# ===== FIM modules\WindowsFeatures.ps1 =====
+
+# ===== INICIO modules\BaseConfig.ps1 =====
+# ============================================================================
+#  BaseConfig.ps1  -  Hardening / Configuracao base do Windows Server
+#  Funcoes chamadas pelo setup.ps1. Dependem do Common.ps1 (Write-Log etc).
+# ============================================================================
+
+# --- Desativar IE Enhanced Security Configuration (IE ESC) ------------------
+function Disable-IEEsc {
+    Write-Log "Desativando o IE Enhanced Security Configuration (IE ESC)..." -Level STEP
+
+    # {..A7..} = Administradores  |  {..A8..} = Usuarios
+    $admin = 'HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{A509B1A7-37EF-4b3f-8CFC-4F3A74704073}'
+    $user  = 'HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\{A509B1A8-37EF-4b3f-8CFC-4F3A74704073}'
+
+    $changed = $false
+    if (Test-Path $admin) { if (Set-RegistryValue -Path $admin -Name 'IsInstalled' -Value 0 -Type DWord) { $changed = $true } }
+    else { Write-Log "Componente IE ESC (Admin) nao encontrado - pode ja estar removido." -Level WARN }
+
+    if (Test-Path $user)  { if (Set-RegistryValue -Path $user  -Name 'IsInstalled' -Value 0 -Type DWord) { $changed = $true } }
+    else { Write-Log "Componente IE ESC (Usuario) nao encontrado - pode ja estar removido." -Level WARN }
+
+    if ($changed) {
+        # Reinicia o Explorer para aplicar a mudanca de imediato
+        Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 1
+        if (-not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) { Start-Process explorer.exe }
+        Write-Log "IE ESC desativado." -Level OK
+    } else {
+        Write-Log "IE ESC ja estava desativado." -Level OK
+    }
+}
+
+# --- Time zone para Brasilia ------------------------------------------------
+function Set-TimeZoneBrasilia {
+    $tzId = 'E. South America Standard Time'   # = Brasilia (UTC-03:00)
+    Write-Log "Ajustando time zone para '$tzId' (Brasilia)..." -Level STEP
+
+    $current = (Get-TimeZone).Id
+    if ($current -eq $tzId) {
+        Write-Log "Time zone ja esta em Brasilia." -Level OK
+        return
+    }
+
+    Set-TimeZone -Id $tzId
+    Write-Log "Time zone alterado de '$current' para Brasilia." -Level OK
+}
+
+# --- Ajustar data/hora atual (sincronizacao NTP) ---------------------------
+function Sync-DateTime {
+    Write-Log "Configurando e sincronizando o relogio (NTP)..." -Level STEP
+
+    # Servidores NTP do NTP.br + fallback Microsoft (0x8 = client mode)
+    $peers = 'a.st1.ntp.br,0x8 b.st1.ntp.br,0x8 time.windows.com,0x8'
+
+    try {
+        Set-Service -Name w32time -StartupType Automatic
+        Start-Service -Name w32time -ErrorAction SilentlyContinue
+
+        # Em maquina fora de dominio, define a lista manual de servidores
+        & w32tm.exe /config /manualpeerlist:"$peers" /syncfromflags:manual /update | Out-Null
+        Restart-Service -Name w32time
+        Start-Sleep -Seconds 2
+        & w32tm.exe /resync /force | Out-Null
+
+        Write-Log "Relogio sincronizado. Hora atual: $((Get-Date).ToString('dd/MM/yyyy HH:mm:ss'))" -Level OK
+    }
+    catch {
+        Write-Log "Falha ao sincronizar o relogio: $($_.Exception.Message)" -Level ERRO
+    }
+}
+
+# --- Nao iniciar o Server Manager automaticamente no logon -----------------
+function Disable-ServerManagerAutoStart {
+    Write-Log "Desabilitando inicio automatico do Server Manager no logon..." -Level STEP
+
+    # Registro: vale para a maquina (todos os admins)
+    Set-RegistryValue -Path 'HKLM:\SOFTWARE\Microsoft\ServerManager' -Name 'DoNotOpenServerManagerAtLogon' -Value 1 -Type DWord | Out-Null
+
+    # Desativa tambem a tarefa agendada que abre o Server Manager
+    try {
+        $task = Get-ScheduledTask -TaskName 'ServerManager' -TaskPath '\Microsoft\Windows\Server Manager\' -ErrorAction Stop
+        if ($task.State -ne 'Disabled') {
+            Disable-ScheduledTask -TaskName 'ServerManager' -TaskPath '\Microsoft\Windows\Server Manager\' | Out-Null
+            Write-Log "Tarefa agendada do Server Manager desativada." -Level OK
+        } else {
+            Write-Log "Tarefa agendada do Server Manager ja estava desativada." -Level OK
+        }
+    }
+    catch {
+        Write-Log "Tarefa agendada do Server Manager nao encontrada (ok)." -Level WARN
+    }
+}
+
+# --- Submenu da configuracao base ------------------------------------------
+function Invoke-BaseConfigMenu {
+    do {
+        Write-Host ""
+        Write-Host "  --- Hardening / Configuracao base ---" -ForegroundColor Cyan
+        Write-Host "    1) Aplicar TODAS as opcoes abaixo"
+        Write-Host "    2) Desativar IE Enhanced Security Configuration"
+        Write-Host "    3) Time zone para Brasilia"
+        Write-Host "    4) Ajustar/sincronizar data e hora (NTP)"
+        Write-Host "    5) Nao iniciar Server Manager no logon"
+        Write-Host "    0) Voltar"
+        Write-Host ""
+        $o = Read-Host "Escolha"
+
+        switch ($o) {
+            '1' {
+                Disable-IEEsc
+                Set-TimeZoneBrasilia
+                Sync-DateTime
+                Disable-ServerManagerAutoStart
+            }
+            '2' { Disable-IEEsc }
+            '3' { Set-TimeZoneBrasilia }
+            '4' { Sync-DateTime }
+            '5' { Disable-ServerManagerAutoStart }
+            '0' { }
+            default { Write-Host "Opcao invalida." -ForegroundColor Red }
+        }
+    } while ($o -ne '0')
+}
+# ===== FIM modules\BaseConfig.ps1 =====
+
+# ===== INICIO modules\IIS.ps1 =====
+# ============================================================================
+#  IIS.ps1  -  Instalacao do IIS + ASP.NET / WCF / WAS / MSMQ
+#  Baseado na lista de features DISM fornecida. Depende do Common.ps1.
+#
+#  Usa Enable-OptionalFeatureSafe (Common.ps1): -NoRestart, guarda de reinicio
+#  pendente (defere), deteccao de reinicio exigido e registro no resumo.
+# ============================================================================
+
+# Lista ordenada e SEM duplicatas das features. -All ($true) puxa dependencias.
+# A ordem coloca .NET/WAS/core do IIS primeiro; o -All resolve o resto.
+$Script:IISFeatures = @(
+    # .NET Framework
+    'NetFx3'                                          # ASP.NET 3.5 (.NET 3.5)
+
+    # Nucleo do IIS
+    'IIS-WebServerRole'
+    'IIS-WebServer'
+
+    # ASP.NET / extensibilidade
+    'IIS-ASPNET45'                                    # ASP.NET 4.x
+    'IIS-ASPNET'
+    'IIS-NetFxExtensibility'
+
+    # Ferramentas de gerenciamento
+    'IIS-ManagementConsole'
+    'IIS-ManagementScriptingTools'
+    'IIS-ManagementService'
+
+    # Common HTTP Features
+    'IIS-HttpRedirect'
+    'IIS-WebDAV'
+    'IIS-ApplicationInit'
+
+    # Health and Diagnostics
+    'IIS-CustomLogging'
+    'IIS-LoggingLibraries'
+    'IIS-ODBCLogging'
+    'IIS-RequestMonitor'
+    'IIS-HttpTracing'
+
+    # Performance
+    'IIS-HttpCompressionDynamic'
+
+    # Security
+    'IIS-RequestFiltering'
+    'IIS-BasicAuthentication'
+    'IIS-CertProvider'
+    'IIS-ClientCertificateMappingAuthentication'
+    'IIS-DigestAuthentication'
+    'IIS-IISCertificateMappingAuthentication'
+    'IIS-IPSecurity'
+    'IIS-URLAuthorization'
+    'IIS-WindowsAuthentication'
+
+    # Application Development
+    'IIS-ServerSideIncludes'
+    'IIS-WebSockets'
+
+    # WAS - Windows Process Activation Service
+    'WAS-WindowsActivationService'
+    'WAS-ProcessModel'
+    'WAS-NetFxEnvironment'
+    'WAS-ConfigurationAPI'
+
+    # MSMQ
+    'MSMQ'
+    'MSMQ-Services'
+    'MSMQ-Server'
+
+    # WCF Activation
+    'WCF-HTTP-Activation'
+    'WCF-NonHTTP-Activation'
+    'WCF-HTTP-Activation45'
+    'WCF-MSMQ-Activation45'
+    'WCF-Pipe-Activation45'
+    'WCF-TCP-Activation45'
+)
+
+# --- Servico aspnet_state em automatico ------------------------------------
+function Set-AspNetStateAuto {
+    Write-Log "Configurando o servico 'aspnet_state' para inicio automatico..." -Level STEP
+    $svc = Get-Service -Name aspnet_state -ErrorAction SilentlyContinue
+    if (-not $svc) {
+        Write-Log "Servico 'aspnet_state' nao encontrado (instale o ASP.NET State Service antes)." -Level WARN
+        return
+    }
+    Set-Service -Name aspnet_state -StartupType Automatic
+    Write-Log "'aspnet_state' definido como Automatico." -Level OK
+}
+
+# --- iisreset (so quando seguro) -------------------------------------------
+function Invoke-IISReset {
+    if (Test-PendingReboot) {
+        Write-Log "iisreset ADIADO: ha reinicio pendente. Execute apos reiniciar o servidor." -Level WARN
+        return
+    }
+    if (-not (Get-Service -Name W3SVC -ErrorAction SilentlyContinue)) {
+        Write-Log "Servico W3SVC (IIS) nao encontrado - iisreset ignorado." -Level WARN
+        return
+    }
+    Write-Log "Executando iisreset..." -Level STEP
+    & iisreset.exe | Out-Null
+    Write-Log "iisreset concluido." -Level OK
+}
+
+# --- Instalacao completa do IIS --------------------------------------------
+function Install-IISFull {
+    Write-Log "Iniciando instalacao do conjunto IIS ($($Script:IISFeatures.Count) features)..." -Level STEP
+
+    foreach ($feat in $Script:IISFeatures) {
+        # Se um item gerar reinicio pendente, os proximos serao deferidos
+        # automaticamente por Enable-OptionalFeatureSafe (e entram no resumo).
+        Enable-OptionalFeatureSafe -FeatureName $feat -All
+    }
+
+    # Pos-configuracao
+    Set-AspNetStateAuto
+    Invoke-IISReset
+}
+
+# --- Submenu do IIS ---------------------------------------------------------
+function Invoke-IISMenu {
+    Reset-FeatureSession
+
+    if (Test-PendingReboot) {
+        Write-Log "AVISO: ja existe reinicio pendente. As features serao DEFERIDAS." -Level WARN
+        Write-Log "Recomendado reiniciar o servidor antes de instalar o IIS." -Level WARN
+    }
+
+    do {
+        Write-Host ""
+        Write-Host "  --- IIS / Servidor Web ---" -ForegroundColor Cyan
+        Write-Host "    1) Instalar IIS COMPLETO (lista padrao: IIS + ASP.NET + WCF + WAS + MSMQ)"
+        Write-Host "    2) Configurar aspnet_state como Automatico"
+        Write-Host "    3) Executar iisreset"
+        Write-Host "    9) Ver resumo da sessao"
+        Write-Host "    0) Voltar (mostra resumo)"
+        Write-Host ""
+        $o = Read-Host "Escolha"
+
+        switch ($o) {
+            '1' { Install-IISFull }
+            '2' { Set-AspNetStateAuto }
+            '3' { Invoke-IISReset }
+            '9' { Show-FeaturesSummary }
+            '0' { }
+            default { Write-Host "Opcao invalida." -ForegroundColor Red }
+        }
+    } while ($o -ne '0')
+
+    Show-FeaturesSummary
+}
+# ===== FIM modules\IIS.ps1 =====
+
+# ===== INICIO modules\Software.ps1 =====
+# ============================================================================
+#  Software.ps1  -  Instalacao de softwares/runtimes via Chocolatey ou winget
+#  Depende do Common.ps1 (Write-Log, Add-FeatureResult, Show-FeaturesSummary,
+#  Test-PendingReboot, Reset-FeatureSession).
+#
+#  - Catalogo data-driven: cada app tem id do choco E/OU id do winget (IDs do
+#    winget verificados na fonte 'winget' deste tipo de SO).
+#  - O usuario escolhe o gerenciador: winget, choco ou auto (winget e fallback choco).
+#  - Sempre roda nao-interativo (-y / --accept-*) e registra cada resultado.
+# ============================================================================
+
+# --- Bootstrap do Chocolatey (idempotente) ---------------------------------
+function Install-Chocolatey {
+    if (Get-Command choco -ErrorAction SilentlyContinue) {
+        Write-Log "Chocolatey ja instalado." -Level OK
+        return $true
+    }
+    Write-Log "Instalando o Chocolatey..." -Level STEP
+    try {
+        Set-ExecutionPolicy Bypass -Scope Process -Force
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+        Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+        # Atualiza PATH desta sessao para enxergar o choco recem-instalado
+        $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')
+        if (Get-Command choco -ErrorAction SilentlyContinue) {
+            Write-Log "Chocolatey instalado." -Level OK
+            return $true
+        }
+        Write-Log "Chocolatey instalado, mas 'choco' nao apareceu no PATH desta sessao." -Level WARN
+        return $false
+    }
+    catch {
+        Write-Log "Falha ao instalar o Chocolatey: $($_.Exception.Message)" -Level ERRO
+        return $false
+    }
+}
+
+function Test-WingetAvailable {
+    return [bool](Get-Command winget -ErrorAction SilentlyContinue)
+}
+
+# --- Catalogo ---------------------------------------------------------------
+function New-Pkg {
+    param($Key, $Name, $Category, $Choco, $Winget, $ChocoArgs = @(), $WingetArgs = @(), $Reboot = 'no', $Notes = '')
+    [PSCustomObject]@{
+        Key = $Key; Name = $Name; Category = $Category
+        Choco = $Choco; Winget = $Winget
+        ChocoArgs = @($ChocoArgs); WingetArgs = @($WingetArgs)
+        Reboot = $Reboot; Notes = $Notes
+    }
+}
+
+# Choco='' ou Winget='' => nao disponivel naquele gerenciador.
+$Script:SoftwareCatalog = @(
+    # Web / IIS
+    (New-Pkg 'urlrewrite'    'IIS URL Rewrite'         'Web/IIS'    'urlrewrite' 'Microsoft.IIS.URLRewrite')
+    (New-Pkg 'iis-arr'       'IIS ARR (App Request Routing)' 'Web/IIS' 'iis-arr' 'Microsoft.IIS.ApplicationRequestRouting')
+
+    # Banco de dados
+    (New-Pkg 'sql2022'       'SQL Server 2022'         'Banco'      'sql-server-2022' '' @() @() 'maybe' 'Edicao Developer/Express via choco; sem pacote winget oficial')
+    (New-Pkg 'sql2025'       'SQL Server 2025'         'Banco'      'sql-server-2025' '' @() @() 'maybe' 'Verificar disponibilidade no choco; sem pacote winget oficial')
+    (New-Pkg 'ssms'          'SQL Server Mgmt Studio'  'Banco'      'sql-server-management-studio' 'Microsoft.SQLServerManagementStudio')
+    (New-Pkg 'dbeaver'       'DBeaver (Community)'     'Banco'      'dbeaver' 'DBeaver.DBeaver.Community')
+
+    # Navegadores
+    (New-Pkg 'chrome'        'Google Chrome'           'Navegador'  'googlechrome' 'Google.Chrome' @('--ignore-checksums'))
+    (New-Pkg 'firefox'       'Mozilla Firefox'         'Navegador'  'firefox' 'Mozilla.Firefox')
+    (New-Pkg 'firefox-dev'   'Firefox Developer Ed.'   'Navegador'  'firefox-dev' 'Mozilla.Firefox.DeveloperEdition' @('--pre'))
+
+    # APIs / testes
+    (New-Pkg 'postman'       'Postman'                 'API'        'postman' 'Postman.Postman')
+    (New-Pkg 'insomnia'      'Insomnia REST'           'API'        'insomnia-rest-api-client' 'Insomnia.Insomnia')
+    (New-Pkg 'soapui'        'SoapUI'                  'API'        'soapui' 'SmartBear.SoapUI')
+
+    # Utilitarios
+    (New-Pkg 'notepadpp'     'Notepad++'               'Utilitario' 'notepadplusplus' 'Notepad++.Notepad++')
+    (New-Pkg '7zip'          '7-Zip'                   'Utilitario' '7zip.install' '7zip.7zip')
+    (New-Pkg 'greenshot'     'Greenshot'               'Utilitario' 'greenshot' 'Greenshot.Greenshot')
+    (New-Pkg 'ditto'         'Ditto (clipboard)'       'Utilitario' 'ditto' 'Ditto.Ditto')
+    (New-Pkg 'screentogif'   'ScreenToGif'             'Utilitario' 'screentogif' 'NickeManarin.ScreenToGif')
+    (New-Pkg 'winscp'        'WinSCP'                  'Utilitario' 'winscp' 'WinSCP.WinSCP')
+    (New-Pkg 's3browser'     'S3 Browser'              'Utilitario' 's3browser' 'Netsdk.S3Browser')
+
+    # Acesso remoto / VPN
+    (New-Pkg 'teamviewer'    'TeamViewer'              'Remoto/VPN' 'teamviewer' 'TeamViewer.TeamViewer')
+    (New-Pkg 'forticlient'   'FortiClient VPN'         'Remoto/VPN' 'forticlientvpn' '' @() @() 'no' 'Sem pacote winget; usa choco')
+    (New-Pkg 'openvpn'       'OpenVPN Connect'         'Remoto/VPN' 'openvpn-connect' 'OpenVPNTechnologies.OpenVPNConnect')
+    (New-Pkg 'vncviewer'     'RealVNC Viewer'          'Remoto/VPN' 'vnc-viewer' 'RealVNC.VNCViewer')
+    (New-Pkg 'netbird'       'NetBird'                 'Remoto/VPN' 'netbird' 'Netbird.Netbird')
+    (New-Pkg 'cloudflared'   'Cloudflared'             'Remoto/VPN' 'cloudflared' 'Cloudflare.cloudflared')
+
+    # Cloud
+    (New-Pkg 'azstorage'     'Azure Storage Explorer'  'Cloud'      'microsoftazurestorageexplorer' 'Microsoft.Azure.StorageExplorer')
+    (New-Pkg 'azcopy'        'AzCopy v10'              'Cloud'      'azcopy10' 'Microsoft.Azure.AZCopy.10')
+    (New-Pkg 'azurecli'      'Azure CLI'               'Cloud'      'azure-cli' 'Microsoft.AzureCLI')
+
+    # Runtimes / SDKs
+    (New-Pkg 'dotnet8-sdk'   '.NET 8 SDK'              'Runtime'    'dotnet-8.0-sdk' 'Microsoft.DotNet.SDK.8')
+    (New-Pkg 'dotnet10-sdk'  '.NET 10 SDK'             'Runtime'    'dotnet-10.0-sdk' 'Microsoft.DotNet.SDK.10')
+    (New-Pkg 'dotnet8-host'  '.NET 8 Hosting Bundle'   'Runtime'    'dotnet-8.0-windowshosting' 'Microsoft.DotNet.HostingBundle.8')
+    (New-Pkg 'dotnet10-host' '.NET 10 Hosting Bundle'  'Runtime'    'dotnet-10.0-windowshosting' 'Microsoft.DotNet.HostingBundle.10')
+    (New-Pkg 'jdk21'         'Microsoft OpenJDK 21'    'Runtime'    'microsoft-openjdk-21' 'Microsoft.OpenJDK.21')
+    (New-Pkg 'jdk17'         'OpenJDK 17 (17.0.2)'     'Runtime'    'openjdk' 'Microsoft.OpenJDK.17' @('--version=17.0.2'))
+    (New-Pkg 'maven'         'Apache Maven'            'Runtime'    'maven' '' @() @() 'no' 'Sem pacote winget; usa choco')
+    (New-Pkg 'nodejs'        'Node.js'                 'Runtime'    'nodejs' 'OpenJS.NodeJS')
+
+    # IDEs
+    (New-Pkg 'vs2022'        'Visual Studio 2022 Community' 'IDE'   'visualstudio2022community' 'Microsoft.VisualStudio.2022.Community' @() @() 'no' 'Download grande')
+    (New-Pkg 'androidstudio' 'Android Studio'          'IDE'        'androidstudio' 'Google.AndroidStudio')
+
+    # Containers
+    (New-Pkg 'docker'        'Docker Desktop'          'Container'  'docker-desktop' 'Docker.DockerDesktop' @() @() 'maybe' 'Requer WSL2/Hyper-V; pode pedir reinicio')
+
+    # Midia
+    (New-Pkg 'obs'           'OBS Studio'              'Midia'      'obs-studio' 'OBSProject.OBSStudio')
+    (New-Pkg 'bambustudio'   'Bambu Studio'            'Midia'      'bambustudio' 'Bambulab.Bambustudio')
+
+    # Office
+    (New-Pkg 'office'        'Microsoft 365 / Office'  'Office'     'office365business' 'Microsoft.Office' @() @() 'no' 'Instalacao demorada')
+
+    # Outros
+    (New-Pkg 'git'           'Git'                     'Outros'     'git' 'Git.Git')
+    (New-Pkg 'choco-upg'     'Choco Upgrade-All p/ startup' 'Outros' 'choco-upgrade-all-at-startup' '' @() @() 'no' 'Especifico do Chocolatey')
+)
+
+# --- Resolve o gerenciador efetivo para um pacote ---------------------------
+# Retorna 'winget', 'choco' ou $null (sem fonte).
+function Resolve-Manager {
+    param($Pkg, [string] $Preferred)
+    switch ($Preferred) {
+        'winget' { if ($Pkg.Winget) { return 'winget' } elseif ($Pkg.Choco) { Write-Log "'$($Pkg.Name)' sem pacote winget; usando choco." -Level WARN; return 'choco' } }
+        'choco'  { if ($Pkg.Choco)  { return 'choco' }  elseif ($Pkg.Winget) { Write-Log "'$($Pkg.Name)' sem pacote choco; usando winget." -Level WARN; return 'winget' } }
+        default  { if ($Pkg.Winget) { return 'winget' } elseif ($Pkg.Choco) { return 'choco' } }  # auto
+    }
+    return $null
+}
+
+# --- Instala um pacote ------------------------------------------------------
+function Install-SoftwarePackage {
+    param($Pkg, [string] $Preferred = 'auto')
+
+    $mgr = Resolve-Manager -Pkg $Pkg -Preferred $Preferred
+    if (-not $mgr) {
+        Write-Log "Sem fonte (choco/winget) para '$($Pkg.Name)'." -Level ERRO
+        Add-FeatureResult -Name $Pkg.Name -Status 'Falha' -Detail 'Sem pacote disponivel'
+        return
+    }
+
+    if ($Pkg.Notes) { Write-Log "Nota ($($Pkg.Name)): $($Pkg.Notes)" -Level INFO }
+
+    if ($mgr -eq 'choco') {
+        if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+            if (-not (Install-Chocolatey)) {
+                Add-FeatureResult -Name $Pkg.Name -Status 'Falha' -Detail 'Chocolatey indisponivel'
+                return
+            }
+        }
+        Write-Log "[choco] Instalando '$($Pkg.Name)' ($($Pkg.Choco))..." -Level STEP
+        $argsList = @('install', $Pkg.Choco, '-y', '--no-progress') + $Pkg.ChocoArgs
+        & choco @argsList
+        $code = $LASTEXITCODE
+        if ($code -eq 0) {
+            Write-Log "'$($Pkg.Name)' instalado (choco)." -Level OK
+            Add-FeatureResult -Name $Pkg.Name -Status 'Instalado'
+        }
+        elseif ($code -eq 3010 -or $code -eq 1641) {
+            Write-Log "'$($Pkg.Name)' instalado (choco) - REINICIO necessario." -Level WARN
+            Add-FeatureResult -Name $Pkg.Name -Status 'PrecisaReinicio'
+        }
+        else {
+            Write-Log "Falha ao instalar '$($Pkg.Name)' (choco). ExitCode: $code" -Level ERRO
+            Add-FeatureResult -Name $Pkg.Name -Status 'Falha' -Detail "choco ExitCode $code"
+        }
+    }
+    else {
+        Write-Log "[winget] Instalando '$($Pkg.Name)' ($($Pkg.Winget))..." -Level STEP
+        $argsList = @('install', '--id', $Pkg.Winget, '-e', '--source', 'winget',
+                      '--accept-package-agreements', '--accept-source-agreements',
+                      '--disable-interactivity') + $Pkg.WingetArgs
+        & winget @argsList
+        $code = $LASTEXITCODE
+        if ($code -eq 0) {
+            Write-Log "'$($Pkg.Name)' instalado (winget)." -Level OK
+            Add-FeatureResult -Name $Pkg.Name -Status 'Instalado'
+        }
+        else {
+            Write-Log "Falha/aviso ao instalar '$($Pkg.Name)' (winget). ExitCode: $code" -Level ERRO
+            Add-FeatureResult -Name $Pkg.Name -Status 'Falha' -Detail "winget ExitCode $code"
+        }
+    }
+}
+
+# --- choco upgrade all ------------------------------------------------------
+function Update-AllChoco {
+    if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+        if (-not (Install-Chocolatey)) { return }
+    }
+    Write-Log "Executando 'choco upgrade all -y'..." -Level STEP
+    & choco upgrade all -y --no-progress
+    Write-Log "choco upgrade all concluido (ExitCode $LASTEXITCODE)." -Level OK
+}
+
+# --- Submenu de Softwares ---------------------------------------------------
+function Invoke-SoftwareMenu {
+    Reset-FeatureSession
+
+    # 1) Escolha do gerenciador
+    Write-Host ""
+    Write-Host "  --- Softwares / Runtimes ---" -ForegroundColor Cyan
+    Write-Host "  Gerenciador de instalacao:"
+    Write-Host "    1) winget   2) Chocolatey   3) auto (winget, fallback choco)"
+    $mraw = Read-Host "Escolha [1/2/3]"
+    $preferred = switch ($mraw) { '2' {'choco'} '3' {'auto'} default {'winget'} }
+    Write-Log "Gerenciador selecionado: $preferred" -Level INFO
+
+    if ($preferred -eq 'choco' -or $preferred -eq 'auto') {
+        if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+            if (Confirm-Action "Chocolatey nao esta instalado. Instalar agora?") { Install-Chocolatey | Out-Null }
+        }
+    }
+    if (($preferred -eq 'winget') -and -not (Test-WingetAvailable)) {
+        Write-Log "winget nao encontrado neste SO. Considere usar Chocolatey." -Level WARN
+    }
+
+    do {
+        # Lista numerada do catalogo, por categoria
+        Write-Host ""
+        $i = 0
+        $lastCat = ''
+        foreach ($p in $Script:SoftwareCatalog) {
+            if ($p.Category -ne $lastCat) { Write-Host ("  [{0}]" -f $p.Category) -ForegroundColor DarkCyan; $lastCat = $p.Category }
+            $i++
+            $src = @(); if ($p.Choco) { $src += 'choco' }; if ($p.Winget) { $src += 'winget' }
+            Write-Host ("    {0,2}) {1,-30} ({2})" -f $i, $p.Name, ($src -join '/'))
+        }
+        Write-Host ""
+        Write-Host "    A) Instalar TODOS      U) choco upgrade all      9) Resumo      0) Voltar"
+        $sel = Read-Host "Numeros (ex: 1 4 7), A, U, 9 ou 0"
+
+        if ($sel -match '^[0]$') { break }
+        elseif ($sel -match '^[Uu]$') { Update-AllChoco }
+        elseif ($sel -match '^[9]$') { Show-FeaturesSummary }
+        elseif ($sel -match '^[Aa]$') {
+            foreach ($p in $Script:SoftwareCatalog) { Install-SoftwarePackage -Pkg $p -Preferred $preferred }
+        }
+        else {
+            $nums = $sel -split '[,\s]+' | Where-Object { $_ -match '^\d+$' } | ForEach-Object { [int]$_ }
+            foreach ($n in $nums) {
+                if ($n -ge 1 -and $n -le $Script:SoftwareCatalog.Count) {
+                    Install-SoftwarePackage -Pkg $Script:SoftwareCatalog[$n - 1] -Preferred $preferred
+                } else {
+                    Write-Host "Numero fora da faixa: $n" -ForegroundColor Red
+                }
+            }
+        }
+    } while ($true)
+
+    Show-FeaturesSummary
+}
+# ===== FIM modules\Software.ps1 =====
+
+# ===== INICIO modules\Gui.ps1 =====
+# ============================================================================
+#  Gui.ps1  -  Tela clicavel (WinForms) com fallback de console
+#  Depende de Common.ps1 e OSCommon.ps1 (Get-AvailableCapabilities,
+#  Invoke-CapabilityInstall, Set-LogDirectory, $Script:FeatureResults).
+#
+#  Modelo: a tela e para SELECAO (o que instalar + pasta de log). A instalacao
+#  roda depois que a tela fecha, com log ao vivo no console (Write-Log) e um
+#  resumo final em MessageBox. Isso evita o congelamento da UI e a complexidade
+#  de compartilhar funcoes entre runspaces sob 'irm | iex'.
+# ============================================================================
+
+# Le uma linha do console. Sob 'irm | iex' o pipeline carrega o corpo do script,
+# entao Read-Host pode falhar; [Console]::ReadLine() e mais robusto.
+function Read-Line {
+    param([string] $Prompt)
+    if ($Prompt) { Write-Host $Prompt -NoNewline }
+    try { return [Console]::ReadLine() } catch { return (Read-Host) }
+}
+
+# Monta o texto do resumo (categorizado) a partir de $Script:FeatureResults.
+function Get-SummaryText {
+    if (-not $Script:FeatureResults -or $Script:FeatureResults.Count -eq 0) {
+        return 'Nenhuma acao executada.'
+    }
+    $groups = @(
+        @{ Label = 'Instalados / ja presentes';        Status = @('Instalado','JaPresente') }
+        @{ Label = 'Precisam de REINICIO';             Status = @('PrecisaReinicio') }
+        @{ Label = 'Deferidos (reinicio pendente)';    Status = @('Deferido') }
+        @{ Label = 'Falhas';                           Status = @('Falha') }
+    )
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($g in $groups) {
+        $items = $Script:FeatureResults | Where-Object { $g.Status -contains $_.Status }
+        if ($items) {
+            [void]$sb.AppendLine($g.Label + ':')
+            foreach ($i in $items) {
+                $d = if ($i.Detail) { "  ($($i.Detail))" } else { '' }
+                [void]$sb.AppendLine('   - ' + $i.Name + $d)
+            }
+            [void]$sb.AppendLine('')
+        }
+    }
+    return $sb.ToString()
+}
+
+# --- Tela WinForms ----------------------------------------------------------
+# Retorna [PSCustomObject]@{ Ids=@(...); LogDir='...' } ou $null se cancelado.
+function Show-InstallerGui {
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+    Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+
+    $caps = @(Get-AvailableCapabilities)
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = 'Configurador Windows'
+    $form.Size = New-Object System.Drawing.Size(540, 580)
+    $form.StartPosition = 'CenterScreen'
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.MaximizeBox = $false
+
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = 'Selecione o que instalar/configurar:'
+    $lbl.Location = New-Object System.Drawing.Point(12, 12)
+    $lbl.AutoSize = $true
+    $form.Controls.Add($lbl)
+
+    $clb = New-Object System.Windows.Forms.CheckedListBox
+    $clb.Location = New-Object System.Drawing.Point(12, 36)
+    $clb.Size = New-Object System.Drawing.Size(500, 360)
+    $clb.CheckOnClick = $true
+    foreach ($c in $caps) {
+        $txt = "{0}   [{1}]" -f $c.Display, $c.Category
+        if ($c.Notes) { $txt += "  - $($c.Notes)" }
+        [void]$clb.Items.Add($txt)
+    }
+    $form.Controls.Add($clb)
+
+    $btnAll = New-Object System.Windows.Forms.Button
+    $btnAll.Text = 'Selecionar tudo'
+    $btnAll.Location = New-Object System.Drawing.Point(12, 404)
+    $btnAll.Size = New-Object System.Drawing.Size(120, 28)
+    $btnAll.Add_Click({
+        $allChecked = $true
+        for ($i = 0; $i -lt $clb.Items.Count; $i++) { if (-not $clb.GetItemChecked($i)) { $allChecked = $false; break } }
+        for ($i = 0; $i -lt $clb.Items.Count; $i++) { $clb.SetItemChecked($i, -not $allChecked) }
+    })
+    $form.Controls.Add($btnAll)
+
+    $lblLog = New-Object System.Windows.Forms.Label
+    $lblLog.Text = 'Pasta de log:'
+    $lblLog.Location = New-Object System.Drawing.Point(12, 446)
+    $lblLog.AutoSize = $true
+    $form.Controls.Add($lblLog)
+
+    $logBox = New-Object System.Windows.Forms.TextBox
+    $logBox.Location = New-Object System.Drawing.Point(12, 468)
+    $logBox.Size = New-Object System.Drawing.Size(500, 24)
+    $logBox.Text = $Script:DefaultLogDir
+    $form.Controls.Add($logBox)
+
+    $btnInstall = New-Object System.Windows.Forms.Button
+    $btnInstall.Text = 'Instalar'
+    $btnInstall.Location = New-Object System.Drawing.Point(316, 506)
+    $btnInstall.Size = New-Object System.Drawing.Size(95, 32)
+    $btnInstall.Add_Click({
+        $ids = @()
+        for ($i = 0; $i -lt $clb.Items.Count; $i++) {
+            if ($clb.GetItemChecked($i)) { $ids += $caps[$i].Id }
+        }
+        if ($ids.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show('Selecione ao menos um item.', 'Atencao') | Out-Null
+            return
+        }
+        $form.Tag = [PSCustomObject]@{ Ids = $ids; LogDir = $logBox.Text.Trim() }
+        $form.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        $form.Close()
+    })
+    $form.Controls.Add($btnInstall)
+
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text = 'Cancelar'
+    $btnCancel.Location = New-Object System.Drawing.Point(417, 506)
+    $btnCancel.Size = New-Object System.Drawing.Size(95, 32)
+    $btnCancel.Add_Click({
+        $form.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+        $form.Close()
+    })
+    $form.Controls.Add($btnCancel)
+
+    $dr = $form.ShowDialog()
+    if ($dr -eq [System.Windows.Forms.DialogResult]::OK) { return $form.Tag }
+    return $null
+}
+
+# --- Fallback de console (Server Core / headless / sem STA) ------------------
+# Retorna [PSCustomObject]@{ Ids=@(...); LogDir='...' } ou $null.
+function Show-InstallerConsole {
+    $caps = @(Get-AvailableCapabilities)
+
+    Write-Host ""
+    Write-Host "============ Configurador Windows (console) ============" -ForegroundColor Cyan
+    Write-Host "Capacidades disponiveis neste SO:" -ForegroundColor Cyan
+    for ($i = 0; $i -lt $caps.Count; $i++) {
+        $c = $caps[$i]
+        $note = if ($c.Notes) { " - $($c.Notes)" } else { '' }
+        Write-Host ("  {0,2}) {1,-32} [{2}]{3}" -f ($i + 1), $c.Display, $c.Category, $note)
+    }
+    Write-Host ""
+    Write-Host "Digite os numeros separados por virgula (ex.: 1,3,5) ou 'tudo'." -ForegroundColor Yellow
+    $resp = (Read-Line "Selecao: ").Trim()
+    if (-not $resp) { return $null }
+
+    $ids = @()
+    if ($resp -match '^(tudo|all)$') {
+        $ids = $caps | ForEach-Object { $_.Id }
+    } else {
+        foreach ($tok in ($resp -split '[,\s]+')) {
+            if ($tok -match '^\d+$') {
+                $idx = [int]$tok - 1
+                if ($idx -ge 0 -and $idx -lt $caps.Count) { $ids += $caps[$idx].Id }
+            }
+        }
+    }
+    $ids = $ids | Select-Object -Unique
+    if (-not $ids -or @($ids).Count -eq 0) { return $null }
+
+    Write-Host ""
+    $logDir = (Read-Line "Pasta de log (ENTER = $($Script:DefaultLogDir)): ").Trim()
+    if (-not $logDir) { $logDir = $Script:DefaultLogDir }
+
+    return [PSCustomObject]@{ Ids = @($ids); LogDir = $logDir }
+}
+
+# --- Orquestrador: escolhe GUI vs console e roda a instalacao ----------------
+function Start-InstallerUi {
+    $useGui = (Get-OSRole).CanUseGui
+
+    $sel = $null
+    if ($useGui) {
+        try { $sel = Show-InstallerGui }
+        catch {
+            Write-Log "GUI indisponivel ($($_.Exception.Message)) - caindo para console." -Level WARN
+            $useGui = $false
+            $sel = Show-InstallerConsole
+        }
+    } else {
+        $sel = Show-InstallerConsole
+    }
+
+    if (-not $sel -or -not $sel.Ids -or @($sel.Ids).Count -eq 0) {
+        Write-Log "Nenhum item selecionado. Saindo." -Level INFO
+        return
+    }
+
+    if ($sel.LogDir) { Set-LogDirectory -Path $sel.LogDir }
+
+    Invoke-CapabilityInstall -Ids $sel.Ids
+
+    $summary = Get-SummaryText
+    if ($useGui) {
+        try { [System.Windows.Forms.MessageBox]::Show($summary, 'Resumo da instalacao') | Out-Null } catch { }
+    }
+}
+# ===== FIM modules\Gui.ps1 =====
+
+# ===== INICIO bootstrap-tail.ps1 =====
+# ============================================================================
+#  TAIL (payload)  -  ultima parte do bundle, apos os modulos carregarem.
+#  Sob o launcher (irm | iex) ja estamos Admin + STA. Abre a tela hibrida
+#  (GUI se houver, senao console) e roda a instalacao das capacidades.
+# ============================================================================
+Start-InstallerUi
+# ===== FIM bootstrap-tail.ps1 =====
+

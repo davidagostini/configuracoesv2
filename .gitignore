@@ -2,8 +2,11 @@
 logs/
 *.log
 
-# Artefato de build (gerado pelo passo de bundle, opcional versionar)
-dist/
+# Artefatos de build: ignora dist/ exceto os arquivos PUBLICADOS (servidos via irm).
+dist/*
+!dist/bootstrap.ps1
+!dist/payload.ps1
+!dist/payload.ps1.sha256
 
 # Lixo do Windows
 Thumbs.db
