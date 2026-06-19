@@ -33,6 +33,7 @@ function Install-HyperVRole {
     if (-not (Test-CanInstallOrDefer -Name $name)) { return }
 
     Write-Log "Instalando Hyper-V (com ferramentas de gerenciamento)..." -Level STEP
+    Start-FeatureTimer -Name $name
     # Install-WindowsFeature NAO tem -NoRestart; por padrao ja nao reinicia (so com -Restart).
     $result = Install-WindowsFeature -Name Hyper-V -IncludeManagementTools
 
@@ -87,6 +88,7 @@ function New-NatSwitch {
     $ifAlias   = "vEthernet ($SwitchName)"
 
     try {
+        Start-FeatureTimer -Name $display
         # 1) Switch virtual interno
         if (Get-VMSwitch -Name $SwitchName -ErrorAction SilentlyContinue) {
             Write-Log "Switch '$SwitchName' ja existe - mantido." -Level OK
@@ -231,6 +233,7 @@ function Install-DhcpRoleForNat {
     if (-not ($state -and $state.Installed)) {
         if (-not (Test-CanInstallOrDefer -Name $name)) { return $false }
         Write-Log "Instalando a role DHCP (com ferramentas de gerenciamento)..." -Level STEP
+        Start-FeatureTimer -Name $name
         # Install-WindowsFeature NAO tem -NoRestart; por padrao ja nao reinicia (so com -Restart).
         $r = Install-WindowsFeature -Name DHCP -IncludeManagementTools
         if (-not $r.Success) {
@@ -275,6 +278,7 @@ function Set-NatDhcpScope {
     )
     $display = "DHCP scope $ScopeId (NAT)"
     try {
+        Start-FeatureTimer -Name $display
         # 1) Servico
         if ((Get-Service DHCPServer -ErrorAction Stop).Status -ne 'Running') { Start-Service DHCPServer }
         Set-Service DHCPServer -StartupType Automatic

@@ -124,9 +124,37 @@ function Confirm-Action {
 # Lista acumulada de resultados da sessao: PSCustomObject Name/Status/Detail.
 # $Script: aqui = escopo do setup.ps1 (todos os modulos dot-sourced compartilham).
 $Script:FeatureResults = @()
+$Script:FeatureTimers  = @{}   # Name -> [DateTime] de inicio (para medir duracao)
 
 function Reset-FeatureSession {
     $Script:FeatureResults = @()
+    $Script:FeatureTimers  = @{}
+}
+
+# Marca o inicio de uma operacao; Add-FeatureResult usa para calcular a duracao.
+function Start-FeatureTimer {
+    param([Parameter(Mandatory)] [string] $Name)
+    $Script:FeatureTimers[$Name] = (Get-Date)
+}
+
+# Nome/OS da maquina (cacheados) para o cabecalho do ledger.
+$Script:MachineInfo = $null
+function Get-MachineInfo {
+    if (-not $Script:MachineInfo) {
+        $os = ''
+        try { $os = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).Caption } catch { }
+        $Script:MachineInfo = [PSCustomObject]@{ Machine = $env:COMPUTERNAME; OS = $os }
+    }
+    return $Script:MachineInfo
+}
+
+# IPv4 reais do host (sem loopback/link-local) - lidos a cada gravacao do estado.
+function Get-HostIPv4 {
+    try {
+        return @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
+                 Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } |
+                 Select-Object -ExpandProperty IPAddress)
+    } catch { return @() }
 }
 
 function Add-FeatureResult {
@@ -136,12 +164,23 @@ function Add-FeatureResult {
         [string] $Detail = ''
     )
     $Script:FeatureResults += [PSCustomObject]@{ Name = $Name; Status = $Status; Detail = $Detail }
-    # Persiste no ledger para sobreviver a reinicios (a tela "Status" le isso).
-    Save-FeatureState -Name $Name -Status $Status -Detail $Detail
+
+    # Inicio/fim/duracao, se houve Start-FeatureTimer para este Name.
+    $start = ''; $end = ''; $dur = $null
+    if ($Script:FeatureTimers.ContainsKey($Name)) {
+        $t0 = $Script:FeatureTimers[$Name]; $t1 = Get-Date
+        $start = $t0.ToString('yyyy-MM-dd HH:mm:ss')
+        $end   = $t1.ToString('yyyy-MM-dd HH:mm:ss')
+        $dur   = [math]::Round(($t1 - $t0).TotalSeconds, 1)
+        $Script:FeatureTimers.Remove($Name)
+    }
+    Save-FeatureState -Name $Name -Status $Status -Detail $Detail -Start $start -End $end -DurationSec $dur
 }
 
-# --- Estado persistente (ledger) -------------------------------------------
-# Le o ledger (array de @{Name,Status,Detail,Timestamp}). Vazio se nao existir.
+# --- Ledger persistente (1 entrada por item, com SNAPSHOT da maquina) -------
+# Cada item guarda o estado da maquina NAQUELE momento (nome, OS, IPs, reinicio
+# pendente) + inicio/fim/duracao -> material de diagnostico mesmo se o nome ou IP
+# mudarem entre execucoes. A tela "Status" le isso ao abrir.
 function Get-FeatureStateLedger {
     if (-not (Test-Path $Script:StateFile)) { return @() }
     try {
@@ -151,23 +190,38 @@ function Get-FeatureStateLedger {
     } catch { return @() }
 }
 
-# Upsert (por Name) de um resultado no ledger. Mantem o status MAIS RECENTE de
-# cada item, com timestamp. Falha de IO nao interrompe a instalacao (so avisa).
+# Upsert (por Name). Falha de IO so avisa (nao interrompe a instalacao).
 function Save-FeatureState {
     param(
         [Parameter(Mandatory)] [string] $Name,
         [Parameter(Mandatory)] [string] $Status,
-        [string] $Detail = ''
+        [string] $Detail = '',
+        [string] $Start = '',
+        [string] $End = '',
+        $DurationSec = $null
     )
     try {
-        $ledger = @(Get-FeatureStateLedger | Where-Object { $_.Name -ne $Name })
-        $ledger += [PSCustomObject]@{
-            Name = $Name; Status = $Status; Detail = $Detail
-            Timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+        $items = @(Get-FeatureStateLedger | Where-Object { $_.Name -ne $Name })
+        $mi = Get-MachineInfo
+        $items += [PSCustomObject]@{
+            Name          = $Name
+            Status        = $Status
+            Detail        = $Detail
+            Start         = $Start
+            End           = $End
+            DurationSec   = $DurationSec
+            Timestamp     = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+            Machine       = $mi.Machine
+            OS            = $mi.OS
+            IPv4          = @(Get-HostIPv4)
+            RebootPending = [bool](Test-PendingReboot)
         }
         $dir = Split-Path $Script:StateFile -Parent
         if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        ($ledger | ConvertTo-Json -Depth 4) | Set-Content -Path $Script:StateFile -Encoding UTF8
+        # PS 5.1: array de 1 item vira objeto no JSON; forca array.
+        $json = $items | ConvertTo-Json -Depth 5
+        if (@($items).Count -eq 1) { $json = "[$json]" }
+        $json | Set-Content -Path $Script:StateFile -Encoding UTF8
     } catch {
         Write-Log "Nao foi possivel gravar o estado: $($_.Exception.Message)" -Level WARN
     }
@@ -241,6 +295,7 @@ function Enable-OptionalFeatureSafe {
 
     try {
         Write-Log "Habilitando '$DisplayName' ($FeatureName)..." -Level STEP
+        Start-FeatureTimer -Name $DisplayName
         $eparams = @{
             Online      = $true
             FeatureName = $FeatureName

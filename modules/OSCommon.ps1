@@ -138,6 +138,7 @@ function Install-CapabilityServerRole {
 
     try {
         Write-Log "Instalando '$Display' (role $RoleName)..." -Level STEP
+        Start-FeatureTimer -Name $Display
         # Install-WindowsFeature NAO tem -NoRestart; por padrao ja nao reinicia (so com -Restart).
         $r = Install-WindowsFeature -Name $RoleName -IncludeManagementTools:$IncludeManagementTools -ErrorAction Stop
         if ($r.Success) {

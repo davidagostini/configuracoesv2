@@ -234,6 +234,7 @@ function Install-SoftwarePackage {
     }
 
     if ($Pkg.Notes) { Write-Log "Nota ($($Pkg.Name)): $($Pkg.Notes)" -Level INFO }
+    Start-FeatureTimer -Name $Pkg.Name
 
     if ($mgr -eq 'choco') {
         if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {

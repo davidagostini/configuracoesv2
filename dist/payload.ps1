@@ -129,9 +129,37 @@ function Confirm-Action {
 # Lista acumulada de resultados da sessao: PSCustomObject Name/Status/Detail.
 # $Script: aqui = escopo do setup.ps1 (todos os modulos dot-sourced compartilham).
 $Script:FeatureResults = @()
+$Script:FeatureTimers  = @{}   # Name -> [DateTime] de inicio (para medir duracao)
 
 function Reset-FeatureSession {
     $Script:FeatureResults = @()
+    $Script:FeatureTimers  = @{}
+}
+
+# Marca o inicio de uma operacao; Add-FeatureResult usa para calcular a duracao.
+function Start-FeatureTimer {
+    param([Parameter(Mandatory)] [string] $Name)
+    $Script:FeatureTimers[$Name] = (Get-Date)
+}
+
+# Nome/OS da maquina (cacheados) para o cabecalho do ledger.
+$Script:MachineInfo = $null
+function Get-MachineInfo {
+    if (-not $Script:MachineInfo) {
+        $os = ''
+        try { $os = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).Caption } catch { }
+        $Script:MachineInfo = [PSCustomObject]@{ Machine = $env:COMPUTERNAME; OS = $os }
+    }
+    return $Script:MachineInfo
+}
+
+# IPv4 reais do host (sem loopback/link-local) - lidos a cada gravacao do estado.
+function Get-HostIPv4 {
+    try {
+        return @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
+                 Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } |
+                 Select-Object -ExpandProperty IPAddress)
+    } catch { return @() }
 }
 
 function Add-FeatureResult {
@@ -141,12 +169,23 @@ function Add-FeatureResult {
         [string] $Detail = ''
     )
     $Script:FeatureResults += [PSCustomObject]@{ Name = $Name; Status = $Status; Detail = $Detail }
-    # Persiste no ledger para sobreviver a reinicios (a tela "Status" le isso).
-    Save-FeatureState -Name $Name -Status $Status -Detail $Detail
+
+    # Inicio/fim/duracao, se houve Start-FeatureTimer para este Name.
+    $start = ''; $end = ''; $dur = $null
+    if ($Script:FeatureTimers.ContainsKey($Name)) {
+        $t0 = $Script:FeatureTimers[$Name]; $t1 = Get-Date
+        $start = $t0.ToString('yyyy-MM-dd HH:mm:ss')
+        $end   = $t1.ToString('yyyy-MM-dd HH:mm:ss')
+        $dur   = [math]::Round(($t1 - $t0).TotalSeconds, 1)
+        $Script:FeatureTimers.Remove($Name)
+    }
+    Save-FeatureState -Name $Name -Status $Status -Detail $Detail -Start $start -End $end -DurationSec $dur
 }
 
-# --- Estado persistente (ledger) -------------------------------------------
-# Le o ledger (array de @{Name,Status,Detail,Timestamp}). Vazio se nao existir.
+# --- Ledger persistente (1 entrada por item, com SNAPSHOT da maquina) -------
+# Cada item guarda o estado da maquina NAQUELE momento (nome, OS, IPs, reinicio
+# pendente) + inicio/fim/duracao -> material de diagnostico mesmo se o nome ou IP
+# mudarem entre execucoes. A tela "Status" le isso ao abrir.
 function Get-FeatureStateLedger {
     if (-not (Test-Path $Script:StateFile)) { return @() }
     try {
@@ -156,23 +195,38 @@ function Get-FeatureStateLedger {
     } catch { return @() }
 }
 
-# Upsert (por Name) de um resultado no ledger. Mantem o status MAIS RECENTE de
-# cada item, com timestamp. Falha de IO nao interrompe a instalacao (so avisa).
+# Upsert (por Name). Falha de IO so avisa (nao interrompe a instalacao).
 function Save-FeatureState {
     param(
         [Parameter(Mandatory)] [string] $Name,
         [Parameter(Mandatory)] [string] $Status,
-        [string] $Detail = ''
+        [string] $Detail = '',
+        [string] $Start = '',
+        [string] $End = '',
+        $DurationSec = $null
     )
     try {
-        $ledger = @(Get-FeatureStateLedger | Where-Object { $_.Name -ne $Name })
-        $ledger += [PSCustomObject]@{
-            Name = $Name; Status = $Status; Detail = $Detail
-            Timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+        $items = @(Get-FeatureStateLedger | Where-Object { $_.Name -ne $Name })
+        $mi = Get-MachineInfo
+        $items += [PSCustomObject]@{
+            Name          = $Name
+            Status        = $Status
+            Detail        = $Detail
+            Start         = $Start
+            End           = $End
+            DurationSec   = $DurationSec
+            Timestamp     = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+            Machine       = $mi.Machine
+            OS            = $mi.OS
+            IPv4          = @(Get-HostIPv4)
+            RebootPending = [bool](Test-PendingReboot)
         }
         $dir = Split-Path $Script:StateFile -Parent
         if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        ($ledger | ConvertTo-Json -Depth 4) | Set-Content -Path $Script:StateFile -Encoding UTF8
+        # PS 5.1: array de 1 item vira objeto no JSON; forca array.
+        $json = $items | ConvertTo-Json -Depth 5
+        if (@($items).Count -eq 1) { $json = "[$json]" }
+        $json | Set-Content -Path $Script:StateFile -Encoding UTF8
     } catch {
         Write-Log "Nao foi possivel gravar o estado: $($_.Exception.Message)" -Level WARN
     }
@@ -246,6 +300,7 @@ function Enable-OptionalFeatureSafe {
 
     try {
         Write-Log "Habilitando '$DisplayName' ($FeatureName)..." -Level STEP
+        Start-FeatureTimer -Name $DisplayName
         $eparams = @{
             Online      = $true
             FeatureName = $FeatureName
@@ -450,6 +505,7 @@ function Install-CapabilityServerRole {
 
     try {
         Write-Log "Instalando '$Display' (role $RoleName)..." -Level STEP
+        Start-FeatureTimer -Name $Display
         # Install-WindowsFeature NAO tem -NoRestart; por padrao ja nao reinicia (so com -Restart).
         $r = Install-WindowsFeature -Name $RoleName -IncludeManagementTools:$IncludeManagementTools -ErrorAction Stop
         if ($r.Success) {
@@ -593,6 +649,7 @@ function Install-HyperVRole {
     if (-not (Test-CanInstallOrDefer -Name $name)) { return }
 
     Write-Log "Instalando Hyper-V (com ferramentas de gerenciamento)..." -Level STEP
+    Start-FeatureTimer -Name $name
     # Install-WindowsFeature NAO tem -NoRestart; por padrao ja nao reinicia (so com -Restart).
     $result = Install-WindowsFeature -Name Hyper-V -IncludeManagementTools
 
@@ -647,6 +704,7 @@ function New-NatSwitch {
     $ifAlias   = "vEthernet ($SwitchName)"
 
     try {
+        Start-FeatureTimer -Name $display
         # 1) Switch virtual interno
         if (Get-VMSwitch -Name $SwitchName -ErrorAction SilentlyContinue) {
             Write-Log "Switch '$SwitchName' ja existe - mantido." -Level OK
@@ -791,6 +849,7 @@ function Install-DhcpRoleForNat {
     if (-not ($state -and $state.Installed)) {
         if (-not (Test-CanInstallOrDefer -Name $name)) { return $false }
         Write-Log "Instalando a role DHCP (com ferramentas de gerenciamento)..." -Level STEP
+        Start-FeatureTimer -Name $name
         # Install-WindowsFeature NAO tem -NoRestart; por padrao ja nao reinicia (so com -Restart).
         $r = Install-WindowsFeature -Name DHCP -IncludeManagementTools
         if (-not $r.Success) {
@@ -835,6 +894,7 @@ function Set-NatDhcpScope {
     )
     $display = "DHCP scope $ScopeId (NAT)"
     try {
+        Start-FeatureTimer -Name $display
         # 1) Servico
         if ((Get-Service DHCPServer -ErrorAction Stop).Status -ne 'Running') { Start-Service DHCPServer }
         Set-Service DHCPServer -StartupType Automatic
@@ -1510,6 +1570,7 @@ function Install-SoftwarePackage {
     }
 
     if ($Pkg.Notes) { Write-Log "Nota ($($Pkg.Name)): $($Pkg.Notes)" -Level INFO }
+    Start-FeatureTimer -Name $Pkg.Name
 
     if ($mgr -eq 'choco') {
         if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
@@ -1926,6 +1987,15 @@ function Confirm-Wpf {
         -eq [System.Windows.MessageBoxResult]::Yes)
 }
 
+# Formata uma lista de nomes para o texto da confirmacao (limita o tamanho).
+function Format-ConfirmList {
+    param([string[]] $Names, [int] $Max = 25)
+    $n = @($Names | Where-Object { $_ })
+    $txt = (($n | Select-Object -First $Max) | ForEach-Object { "  - $_" }) -join "`n"
+    if ($n.Count -gt $Max) { $txt += "`n  ... +$($n.Count - $Max)" }
+    return $txt
+}
+
 function New-WpfHeader {
     param([string] $Text)
     $tb = New-Object System.Windows.Controls.TextBlock
@@ -1952,11 +2022,32 @@ function Set-WpfAllChecks {
     }
 }
 
+# Mapa Name -> item do ledger, apenas dos que estao Instalado/JaPresente.
+function Get-InstalledStateMap {
+    $map = @{}
+    foreach ($it in @(Get-FeatureStateLedger)) {
+        if ($it.Name -and ($it.Status -eq 'Instalado' -or $it.Status -eq 'JaPresente')) { $map[[string]$it.Name] = $it }
+    }
+    return $map
+}
+
+# Marca um checkbox como "ja instalado" (texto ao lado + cor verde) pelo mapa.
+function Set-WpfInstalledMark {
+    param($CheckBox, $Map, [string] $Key)
+    if ($Map.ContainsKey($Key)) {
+        $ts  = $Map[$Key].Timestamp
+        $tag = if ($ts) { "[instalado $($ts.Substring(0,10))]" } else { '[instalado]' }
+        $CheckBox.Content = "$($CheckBox.Content)   $tag"
+        $CheckBox.Foreground = [System.Windows.Media.Brushes]::LightGreen
+    }
+}
+
 # Features: exclui Web/IIS e .NET (vao na aba IIS). Mantem Virtualizacao, Rede,
 # Mensageria. Mantem a ordem do catalogo, agrupando por categoria.
 function Add-WpfFeatureItems {
     param($Panel)
     $Panel.Children.Clear()
+    $map = Get-InstalledStateMap
     $lastCat = ''
     foreach ($c in @(Get-AvailableCapabilities)) {
         if ($c.Category -in @('Web/IIS', '.NET')) { continue }
@@ -1964,6 +2055,7 @@ function Add-WpfFeatureItems {
         $cb = New-Object System.Windows.Controls.CheckBox
         $cb.Content = if ($c.Notes) { "$($c.Display)   ($($c.Notes))" } else { $c.Display }
         $cb.Tag = $c.Id
+        Set-WpfInstalledMark $cb $map $c.Display
         [void]$Panel.Children.Add($cb)
     }
 }
@@ -1973,6 +2065,7 @@ function Add-WpfSoftwareItems {
     param($Panel, [string] $Filter = 'all')
     $Panel.Children.Clear()
     Import-UserSoftwareCatalog | Out-Null
+    $map = Get-InstalledStateMap
     $list = $Script:SoftwareCatalog
     if ($Filter -eq 'winget') { $list = @($list | Where-Object { $_.Winget }) }
     elseif ($Filter -eq 'choco') { $list = @($list | Where-Object { $_.Choco }) }
@@ -1983,6 +2076,7 @@ function Add-WpfSoftwareItems {
         $cb = New-Object System.Windows.Controls.CheckBox
         $cb.Content = "$($p.Name)   ($($src -join '/'))"
         $cb.Tag = $p.Key
+        Set-WpfInstalledMark $cb $map $p.Name
         [void]$Panel.Children.Add($cb)
     }
 }
@@ -1992,11 +2086,13 @@ function Add-WpfSoftwareItems {
 function Add-WpfIisItems {
     param($Panel)
     $Panel.Children.Clear()
+    $map = Get-InstalledStateMap
     [void]$Panel.Children.Add((New-WpfHeader 'Features do IIS (ordem padrao)'))
     foreach ($f in $Script:IISFeatures) {
         $cb = New-Object System.Windows.Controls.CheckBox
         $cb.Content = $f
         $cb.Tag = $f
+        Set-WpfInstalledMark $cb $map $f
         [void]$Panel.Children.Add($cb)
     }
     [void]$Panel.Children.Add((New-WpfHeader 'Pos-instalacao'))
@@ -2014,6 +2110,20 @@ function Set-WpfStatusPanel {
         $RebootLabel.Text = 'Sem reinicio pendente.'
         $RebootLabel.Foreground = [System.Windows.Media.Brushes]::LightGreen
     }
+    # Cabecalho ao vivo: maquina / OS / IPs atuais.
+    $mi = Get-MachineInfo
+    $hMac = New-Object System.Windows.Controls.TextBlock
+    $hMac.Text = "Maquina: $($mi.Machine)    IPs: $((@(Get-HostIPv4) -join ', '))"
+    $hMac.Foreground = [System.Windows.Media.Brushes]::DeepSkyBlue
+    $hMac.Margin = [System.Windows.Thickness]::new(0, 8, 0, 0)
+    [void]$Panel.Children.Add($hMac)
+    if ($mi.OS) {
+        $hOs = New-Object System.Windows.Controls.TextBlock
+        $hOs.Text = "SO: $($mi.OS)"
+        $hOs.Margin = [System.Windows.Thickness]::new(0, 0, 0, 4)
+        [void]$Panel.Children.Add($hOs)
+    }
+
     $ledger = @(Get-FeatureStateLedger)
     if ($ledger.Count -eq 0) {
         [void]$Panel.Children.Add((New-WpfHeader 'Nenhuma execucao registrada ainda.'))
@@ -2031,9 +2141,11 @@ function Set-WpfStatusPanel {
             [void]$Panel.Children.Add((New-WpfHeader $g.Label))
             foreach ($it in $items) {
                 $tb = New-Object System.Windows.Controls.TextBlock
-                $d  = if ($it.Detail) { "  ($($it.Detail))" } else { '' }
-                $ts = if ($it.Timestamp) { "   [$($it.Timestamp)]" } else { '' }
-                $tb.Text = "   - $($it.Name)$d$ts"
+                $d   = if ($it.Detail) { "  ($($it.Detail))" } else { '' }
+                $ts  = if ($it.Timestamp) { "   [$($it.Timestamp)]" } else { '' }
+                $dur = if ($it.DurationSec) { "   $($it.DurationSec)s" } else { '' }
+                $mq  = if ($it.Machine -and $it.Machine -ne $mi.Machine) { "   @$($it.Machine)" } else { '' }
+                $tb.Text = "   - $($it.Name)$d$ts$dur$mq"
                 $tb.Margin = [System.Windows.Thickness]::new(12, 1, 0, 1)
                 [void]$Panel.Children.Add($tb)
             }
@@ -2295,6 +2407,20 @@ function Show-InstallerWpf {
     $reader = New-Object System.Xml.XmlNodeReader $xaml
     $win = [Windows.Markup.XamlReader]::Load($reader)
 
+    # Icone proprio (em vez do icone do PowerShell): usa o do Server Manager
+    # (Server) ou do mmc (fallback). Falha silenciosa mantem o padrao.
+    try {
+        Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+        $iconExe = "$env:WINDIR\System32\ServerManager.exe"
+        if (-not (Test-Path $iconExe)) { $iconExe = "$env:WINDIR\System32\mmc.exe" }
+        $ic = [System.Drawing.Icon]::ExtractAssociatedIcon($iconExe)
+        if ($ic) {
+            $win.Icon = [System.Windows.Interop.Imaging]::CreateBitmapSourceFromHIcon(
+                $ic.Handle, [System.Windows.Int32Rect]::Empty,
+                [System.Windows.Media.Imaging.BitmapSizeOptions]::FromEmptyOptions())
+        }
+    } catch { }
+
     $txtLog = $win.FindName('txtLog'); $btnClose = $win.FindName('btnClose')
     $lblReboot = $win.FindName('lblReboot'); $spStatus = $win.FindName('spStatus')
     $btnRefresh = $win.FindName('btnRefresh'); $btnClearState = $win.FindName('btnClearState')
@@ -2342,11 +2468,12 @@ function Show-InstallerWpf {
     $btnFeatApply.Add_Click({
         $ids = @(Get-WpfCheckedTags $spFeatures)
         if ($ids.Count -eq 0) { $lblFeat.Text = 'Nada selecionado.'; return }
-        if (-not (Confirm-Wpf "Aplicar $($ids.Count) feature(s)?")) { return }
+        $names = @($ids | ForEach-Object { $id = $_; ($Script:CapabilityCatalog | Where-Object { $_.Id -eq $id } | Select-Object -First 1).Display })
+        if (-not (Confirm-Wpf "Aplicar estas $($ids.Count) feature(s)?`n$(Format-ConfirmList $names)")) { return }
         try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog
             Invoke-CapabilityInstall -Ids $ids; $lblFeat.Text = Get-SummaryText
         } catch { $lblFeat.Text = "Erro: $($_.Exception.Message)" }
-        finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot }
+        finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot; Add-WpfFeatureItems $spFeatures }
     })
 
     # --- Softwares ---
@@ -2373,7 +2500,8 @@ function Show-InstallerWpf {
     $btnSoftApply.Add_Click({
         $keys = @(Get-WpfCheckedTags $spSoftware)
         if ($keys.Count -eq 0) { $lblSoft.Text = 'Nada selecionado.'; return }
-        if (-not (Confirm-Wpf "Instalar $($keys.Count) software(s)?")) { return }
+        $names = @($keys | ForEach-Object { $k = $_; ($Script:SoftwareCatalog | Where-Object { $_.Key -eq $k } | Select-Object -First 1).Name })
+        if (-not (Confirm-Wpf "Instalar estes $($keys.Count) software(s)?`n$(Format-ConfirmList $names)")) { return }
         $pref = if ($rbChoco.IsChecked) { 'choco' } elseif ($rbAuto.IsChecked) { 'auto' } else { 'winget' }
         try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog
             Reset-FeatureSession
@@ -2383,7 +2511,7 @@ function Show-InstallerWpf {
             }
             Show-FeaturesSummary; $lblSoft.Text = Get-SummaryText
         } catch { $lblSoft.Text = "Erro: $($_.Exception.Message)" }
-        finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot }
+        finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot; Add-WpfSoftwareItems $spSoftware (& $softFilter) }
     })
 
     # --- IIS ---
@@ -2395,7 +2523,8 @@ function Show-InstallerWpf {
         $doAspnet = $tags -contains '__aspnet_state__'
         $doReset  = $tags -contains '__iisreset__'
         if ($feats.Count -eq 0 -and -not $doAspnet -and -not $doReset) { $lblIis.Text = 'Nada selecionado.'; return }
-        if (-not (Confirm-Wpf "Aplicar $($feats.Count) feature(s) do IIS$(if($doAspnet){' + aspnet_state'})$(if($doReset){' + iisreset'})?")) { return }
+        $lst = @($feats); if ($doAspnet) { $lst += 'aspnet_state = Automatico' }; if ($doReset) { $lst += 'iisreset' }
+        if (-not (Confirm-Wpf "Aplicar no IIS ($($lst.Count) item(ns))?`n$(Format-ConfirmList $lst)")) { return }
         try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog
             Reset-FeatureSession
             foreach ($f in $feats) { Enable-OptionalFeatureSafe -FeatureName $f -All }   # ordem = $IISFeatures
@@ -2403,13 +2532,13 @@ function Show-InstallerWpf {
             if ($doReset)  { Invoke-IISReset }
             Show-FeaturesSummary; $lblIis.Text = Get-SummaryText
         } catch { $lblIis.Text = "Erro: $($_.Exception.Message)" }
-        finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot }
+        finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot; Add-WpfIisItems $spIis }
     })
     $btnIisFull.Add_Click({
         if (-not (Confirm-Wpf "Instalar IIS COMPLETO ($($Script:IISFeatures.Count) features) + aspnet_state + iisreset? Pode demorar.")) { return }
         try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog; Reset-FeatureSession; Install-IISFull; Show-FeaturesSummary; $lblIis.Text = Get-SummaryText }
         catch { $lblIis.Text = "Erro: $($_.Exception.Message)" }
-        finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot }
+        finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot; Add-WpfIisItems $spIis }
     })
     $btnAspNet.Add_Click({
         if (-not (Confirm-Wpf 'Definir o servico aspnet_state como Automatico?')) { return }
