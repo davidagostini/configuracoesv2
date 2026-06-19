@@ -1333,8 +1333,8 @@ $Script:SoftwareCatalog = @(
     (New-Pkg 'iis-arr'       'IIS ARR (App Request Routing)' 'Web/IIS' 'iis-arr' 'Microsoft.IIS.ApplicationRequestRouting')
 
     # Banco de dados
-    (New-Pkg 'sql2022'       'SQL Server 2022'         'Banco'      'sql-server-2022' '' @() @() 'maybe' 'Edicao Developer/Express via choco; sem pacote winget oficial')
-    (New-Pkg 'sql2025'       'SQL Server 2025'         'Banco'      'sql-server-2025' '' @() @() 'maybe' 'Verificar disponibilidade no choco; sem pacote winget oficial')
+    (New-Pkg 'sql2022'       'SQL Server 2022 (Developer)' 'Banco'  'sql-server-2022' '' @() @() 'maybe' 'Edicao Developer via choco; sem pacote winget oficial')
+    (New-Pkg 'sql2025'       'SQL Server 2025 (Developer)' 'Banco'  'sql-server-2025' '' @() @() 'maybe' 'Edicao Developer via choco; sem pacote winget oficial')
     (New-Pkg 'ssms'          'SQL Server Mgmt Studio'  'Banco'      'sql-server-management-studio' 'Microsoft.SQLServerManagementStudio')
     (New-Pkg 'dbeaver'       'DBeaver (Community)'     'Banco'      'dbeaver' 'DBeaver.DBeaver.Community')
 
