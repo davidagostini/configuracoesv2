@@ -191,7 +191,10 @@ function Get-FeatureStateLedger {
     try {
         $raw = Get-Content -Path $Script:StateFile -Raw -Encoding UTF8 -ErrorAction Stop
         if (-not $raw) { return @() }
-        return @($raw | ConvertFrom-Json)
+        # PS 5.1: capturar em variavel antes evita o aninhamento que @(... | ConvertFrom-Json)
+        # causa com 2+ itens (a leitura virava 1 array dentro de outro).
+        $parsed = $raw | ConvertFrom-Json
+        return @($parsed)
     } catch { return @() }
 }
 
@@ -1979,6 +1982,53 @@ function Test-CanUseWpf {
     } catch { return $false }
 }
 
+# Desenha o icone da janela (gordinho loiro de oculos Ray-Ban quadrados) em
+# runtime com GDI+ e devolve um BitmapSource. Self-contained (funciona via irm).
+function New-AppIconImage {
+    try {
+        Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+        $bmp = New-Object System.Drawing.Bitmap(256, 256, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+        $g = [System.Drawing.Graphics]::FromImage($bmp)
+        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $g.Clear([System.Drawing.Color]::Transparent)
+
+        $skin  = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(255, 245, 205, 160))
+        $blond = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(255, 242, 206, 82))
+        $black = [System.Drawing.Color]::FromArgb(255, 25, 25, 25)
+
+        $g.FillEllipse($blond, 28, 18, 200, 160)          # cabelo loiro
+        $g.FillEllipse($skin, 18, 116, 34, 46)            # orelha esq
+        $g.FillEllipse($skin, 204, 116, 34, 46)           # orelha dir
+        $g.FillEllipse($skin, 34, 52, 188, 176)           # rosto gordinho
+        $cheek = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(90, 240, 140, 140))
+        $g.FillEllipse($cheek, 58, 160, 46, 34)           # bochechas
+        $g.FillEllipse($cheek, 152, 160, 46, 34)
+        $lens = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(80, 30, 45, 70))
+        $g.FillRectangle($lens, 60, 104, 56, 52)          # lentes
+        $g.FillRectangle($lens, 140, 104, 56, 52)
+        $frame = New-Object System.Drawing.Pen ($black, 12)
+        $g.DrawRectangle($frame, 60, 104, 56, 52)         # armacao quadrada
+        $g.DrawRectangle($frame, 140, 104, 56, 52)
+        $bar = New-Object System.Drawing.Pen ($black, 10)
+        $g.DrawLine($bar, 116, 120, 140, 120)             # ponte
+        $g.DrawLine($bar, 60, 116, 36, 124)               # hastes
+        $g.DrawLine($bar, 196, 116, 220, 124)
+        $eye = New-Object System.Drawing.SolidBrush ($black)
+        $g.FillEllipse($eye, 82, 122, 15, 15)             # olhos
+        $g.FillEllipse($eye, 162, 122, 15, 15)
+        $mouth = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(255, 120, 60, 50), 10)
+        $g.DrawArc($mouth, 100, 166, 56, 40, 20, 140)     # sorriso
+        $g.Dispose()
+
+        $h = $bmp.GetHicon()
+        $img = [System.Windows.Interop.Imaging]::CreateBitmapSourceFromHIcon(
+            $h, [System.Windows.Int32Rect]::Empty,
+            [System.Windows.Media.Imaging.BitmapSizeOptions]::FromEmptyOptions())
+        $img.Freeze()
+        return $img
+    } catch { return $null }
+}
+
 # Confirmacao Sim/Nao (rede contra cliques enfileirados em acoes pesadas).
 function Confirm-Wpf {
     param([string] $Message)
@@ -2407,17 +2457,21 @@ function Show-InstallerWpf {
     $reader = New-Object System.Xml.XmlNodeReader $xaml
     $win = [Windows.Markup.XamlReader]::Load($reader)
 
-    # Icone proprio (em vez do icone do PowerShell): usa o do Server Manager
-    # (Server) ou do mmc (fallback). Falha silenciosa mantem o padrao.
+    # Icone proprio (gordinho desenhado em runtime). Fallback: Server Manager / mmc.
     try {
-        Add-Type -AssemblyName System.Drawing -ErrorAction Stop
-        $iconExe = "$env:WINDIR\System32\ServerManager.exe"
-        if (-not (Test-Path $iconExe)) { $iconExe = "$env:WINDIR\System32\mmc.exe" }
-        $ic = [System.Drawing.Icon]::ExtractAssociatedIcon($iconExe)
-        if ($ic) {
-            $win.Icon = [System.Windows.Interop.Imaging]::CreateBitmapSourceFromHIcon(
-                $ic.Handle, [System.Windows.Int32Rect]::Empty,
-                [System.Windows.Media.Imaging.BitmapSizeOptions]::FromEmptyOptions())
+        $appIcon = New-AppIconImage
+        if ($appIcon) {
+            $win.Icon = $appIcon
+        } else {
+            Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+            $iconExe = "$env:WINDIR\System32\ServerManager.exe"
+            if (-not (Test-Path $iconExe)) { $iconExe = "$env:WINDIR\System32\mmc.exe" }
+            $ic = [System.Drawing.Icon]::ExtractAssociatedIcon($iconExe)
+            if ($ic) {
+                $win.Icon = [System.Windows.Interop.Imaging]::CreateBitmapSourceFromHIcon(
+                    $ic.Handle, [System.Windows.Int32Rect]::Empty,
+                    [System.Windows.Media.Imaging.BitmapSizeOptions]::FromEmptyOptions())
+            }
         }
     } catch { }
 

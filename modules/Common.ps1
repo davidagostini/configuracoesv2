@@ -186,7 +186,10 @@ function Get-FeatureStateLedger {
     try {
         $raw = Get-Content -Path $Script:StateFile -Raw -Encoding UTF8 -ErrorAction Stop
         if (-not $raw) { return @() }
-        return @($raw | ConvertFrom-Json)
+        # PS 5.1: capturar em variavel antes evita o aninhamento que @(... | ConvertFrom-Json)
+        # causa com 2+ itens (a leitura virava 1 array dentro de outro).
+        $parsed = $raw | ConvertFrom-Json
+        return @($parsed)
     } catch { return @() }
 }
 
