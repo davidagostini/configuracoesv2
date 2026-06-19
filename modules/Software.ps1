@@ -123,6 +123,76 @@ $Script:SoftwareCatalog = @(
     (New-Pkg 'choco-upg'     'Choco Upgrade-All p/ startup' 'Outros' 'choco-upgrade-all-at-startup' '' @() @() 'no' 'Especifico do Chocolatey')
 )
 
+# --- Catalogo de USUARIO (editavel, sem mexer no codigo) --------------------
+# Arquivo JSON onde o usuario adiciona apps proprios (ex.: um lancamento novo).
+# Formato: array de objetos { Key, Name, Category, Winget, Choco, Notes }.
+# Minimo: Name + (Winget ou Choco). Key/Category sao opcionais.
+$Script:UserSoftwareFile = Join-Path (Split-Path $Script:DefaultLogDir -Parent) 'software-extra.json'
+
+# Le o catalogo de usuario e mescla no $Script:SoftwareCatalog (upsert por Key).
+# Idempotente: pode ser chamada de novo que nao duplica. Retorna o nro lido.
+function Import-UserSoftwareCatalog {
+    if (-not (Test-Path $Script:UserSoftwareFile)) { return 0 }
+    try {
+        $raw = Get-Content -Path $Script:UserSoftwareFile -Raw -Encoding UTF8 -ErrorAction Stop
+        if (-not $raw) { return 0 }
+        $items = @($raw | ConvertFrom-Json)
+    } catch {
+        Write-Log "Catalogo de usuario invalido ($($Script:UserSoftwareFile)): $($_.Exception.Message)" -Level WARN
+        return 0
+    }
+    $added = 0
+    foreach ($it in $items) {
+        if (-not $it.Name) { continue }
+        $key = if ($it.Key) { [string]$it.Key } else { ($it.Name -replace '[^0-9A-Za-z]+', '-').Trim('-').ToLower() }
+        if (-not $key) { continue }
+        $cat   = if ($it.Category) { [string]$it.Category } else { 'Usuario' }
+        $reb   = if ($it.Reboot)   { [string]$it.Reboot }   else { 'no' }
+        $cargs = if ($it.ChocoArgs)  { @($it.ChocoArgs) }  else { @() }
+        $wargs = if ($it.WingetArgs) { @($it.WingetArgs) } else { @() }
+        $pkg = New-Pkg $key ([string]$it.Name) $cat ([string]$it.Choco) ([string]$it.Winget) $cargs $wargs $reb ([string]$it.Notes)
+        $Script:SoftwareCatalog = @($Script:SoftwareCatalog | Where-Object { $_.Key -ne $key })
+        $Script:SoftwareCatalog += $pkg
+        $added++
+    }
+    if ($added) { Write-Log "Catalogo de usuario: $added item(ns) carregado(s)." -Level INFO }
+    return $added
+}
+
+# Acrescenta (ou atualiza) um app no catalogo de usuario (grava no JSON).
+function Add-UserSoftware {
+    param(
+        [Parameter(Mandatory)] [string] $Name,
+        [string] $Category = 'Usuario',
+        [string] $Winget = '',
+        [string] $Choco = '',
+        [string] $Notes = ''
+    )
+    if (-not $Winget -and -not $Choco) {
+        Write-Log "Informe ao menos um ID (winget ou choco) para '$Name'." -Level ERRO
+        return $false
+    }
+    $key = ($Name -replace '[^0-9A-Za-z]+', '-').Trim('-').ToLower()
+    if (-not $key) { $key = 'app-' + ([guid]::NewGuid().ToString('N').Substring(0, 6)) }
+
+    $list = @()
+    if (Test-Path $Script:UserSoftwareFile) {
+        try { $raw = Get-Content $Script:UserSoftwareFile -Raw -Encoding UTF8; if ($raw) { $list = @($raw | ConvertFrom-Json) } } catch { }
+    }
+    $list = @($list | Where-Object { $_.Key -ne $key })
+    $list += [PSCustomObject]@{ Key = $key; Name = $Name; Category = $Category; Winget = $Winget; Choco = $Choco; Notes = $Notes }
+    try {
+        $dir = Split-Path $Script:UserSoftwareFile -Parent
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        ($list | ConvertTo-Json -Depth 4) | Set-Content -Path $Script:UserSoftwareFile -Encoding UTF8
+        Write-Log "Software '$Name' adicionado ao catalogo de usuario." -Level OK
+        return $true
+    } catch {
+        Write-Log "Falha ao gravar o catalogo de usuario: $($_.Exception.Message)" -Level ERRO
+        return $false
+    }
+}
+
 # --- Resolve o gerenciador efetivo para um pacote ---------------------------
 # Retorna 'winget', 'choco' ou $null (sem fonte).
 function Resolve-Manager {
@@ -203,6 +273,7 @@ function Update-AllChoco {
 # --- Submenu de Softwares ---------------------------------------------------
 function Invoke-SoftwareMenu {
     Reset-FeatureSession
+    Import-UserSoftwareCatalog | Out-Null   # mescla apps adicionados pelo usuario
 
     # 1) Escolha do gerenciador
     Write-Host ""

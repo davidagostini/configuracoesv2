@@ -18,6 +18,11 @@ if ($PSScriptRoot) {
     $Script:LogFile = Join-Path $Script:DefaultLogDir 'install.log'
 }
 
+# Arquivo de ESTADO (ledger) persistente: registra o que ja foi feito, com status
+# e timestamp, para que ao reabrir (inclusive apos um reinicio) seja possivel
+# mostrar o que ja rodou / o que precisa de reinicio / o que ficou deferido.
+$Script:StateFile = Join-Path (Split-Path $Script:LogFile -Parent) 'installer-state.json'
+
 # Define a pasta onde os logs serao gravados (campo "Pasta de log" da tela).
 # Gera um arquivo por execucao com timestamp passado pelo chamador, ou o
 # install.log padrao quando -FileName nao e informado.
@@ -30,7 +35,8 @@ function Set-LogDirectory {
     if (-not (Test-Path $Path)) {
         New-Item -ItemType Directory -Path $Path -Force | Out-Null
     }
-    $Script:LogFile = Join-Path $Path $FileName
+    $Script:LogFile   = Join-Path $Path $FileName
+    $Script:StateFile = Join-Path $Path 'installer-state.json'
     Write-Log "Pasta de log definida: $Path" -Level INFO
 }
 
@@ -130,6 +136,46 @@ function Add-FeatureResult {
         [string] $Detail = ''
     )
     $Script:FeatureResults += [PSCustomObject]@{ Name = $Name; Status = $Status; Detail = $Detail }
+    # Persiste no ledger para sobreviver a reinicios (a tela "Status" le isso).
+    Save-FeatureState -Name $Name -Status $Status -Detail $Detail
+}
+
+# --- Estado persistente (ledger) -------------------------------------------
+# Le o ledger (array de @{Name,Status,Detail,Timestamp}). Vazio se nao existir.
+function Get-FeatureStateLedger {
+    if (-not (Test-Path $Script:StateFile)) { return @() }
+    try {
+        $raw = Get-Content -Path $Script:StateFile -Raw -Encoding UTF8 -ErrorAction Stop
+        if (-not $raw) { return @() }
+        return @($raw | ConvertFrom-Json)
+    } catch { return @() }
+}
+
+# Upsert (por Name) de um resultado no ledger. Mantem o status MAIS RECENTE de
+# cada item, com timestamp. Falha de IO nao interrompe a instalacao (so avisa).
+function Save-FeatureState {
+    param(
+        [Parameter(Mandatory)] [string] $Name,
+        [Parameter(Mandatory)] [string] $Status,
+        [string] $Detail = ''
+    )
+    try {
+        $ledger = @(Get-FeatureStateLedger | Where-Object { $_.Name -ne $Name })
+        $ledger += [PSCustomObject]@{
+            Name = $Name; Status = $Status; Detail = $Detail
+            Timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+        }
+        $dir = Split-Path $Script:StateFile -Parent
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        ($ledger | ConvertTo-Json -Depth 4) | Set-Content -Path $Script:StateFile -Encoding UTF8
+    } catch {
+        Write-Log "Nao foi possivel gravar o estado: $($_.Exception.Message)" -Level WARN
+    }
+}
+
+# Zera o ledger (botao "Limpar historico" na tela Status).
+function Clear-FeatureState {
+    if (Test-Path $Script:StateFile) { Remove-Item -Path $Script:StateFile -Force -ErrorAction SilentlyContinue }
 }
 
 # Detecta reinicio pendente por varias fontes conhecidas do Windows.
