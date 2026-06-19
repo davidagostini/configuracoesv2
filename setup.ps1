@@ -35,10 +35,12 @@ if (-not $pr.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
 # --- Carrega os modulos (dot-source) ---------------------------------------
 $ModulesDir = Join-Path $PSScriptRoot 'modules'
 . (Join-Path $ModulesDir 'Common.ps1')
+. (Join-Path $ModulesDir 'OSCommon.ps1')
 . (Join-Path $ModulesDir 'Customizations.ps1')
 . (Join-Path $ModulesDir 'WindowsFeatures.ps1')
 . (Join-Path $ModulesDir 'BaseConfig.ps1')
 . (Join-Path $ModulesDir 'IIS.ps1')
+. (Join-Path $ModulesDir 'Software.ps1')
 
 # --- Menu -------------------------------------------------------------------
 function Show-Menu {
@@ -75,7 +77,7 @@ do {
         '4' { if (Show-HiddenFiles)    { Restart-Explorer } }
         '5' { Invoke-IISMenu }
         '6' { Invoke-FeaturesMenu }
-        '7' { Write-Log "Modulo Softwares ainda nao implementado." -Level WARN }
+        '7' { Invoke-SoftwareMenu }
         '8' { Invoke-BaseConfigMenu }
         '0' { Write-Log "Saindo." -Level INFO }
         default { Write-Host "Opcao invalida." -ForegroundColor Red }

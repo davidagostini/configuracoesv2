@@ -10,9 +10,18 @@
 # ============================================================================
 
 # --- Hyper-V (Role) - REQUER REINICIO --------------------------------------
+# OS-aware: no Windows 11 (sem ServerManager) usa Enable-WindowsOptionalFeature
+# com o feature 'Microsoft-Hyper-V-All'; no Windows Server usa Install-WindowsFeature.
 function Install-HyperVRole {
     $name = 'Hyper-V'
     Write-Log "Verificando a role Hyper-V..." -Level STEP
+
+    # Windows client (Win11 Pro/Ent/Edu): caminho DISM. Install-WindowsFeature nao existe aqui.
+    if (-not (Get-OSRole).HasServerManager) {
+        Write-Log "SO client detectado - usando Enable-WindowsOptionalFeature (Microsoft-Hyper-V-All)." -Level INFO
+        Enable-OptionalFeatureSafe -FeatureName 'Microsoft-Hyper-V-All' -DisplayName 'Hyper-V' -All
+        return
+    }
 
     $state = Get-WindowsFeature -Name Hyper-V -ErrorAction SilentlyContinue
     if ($state -and $state.Installed) {
