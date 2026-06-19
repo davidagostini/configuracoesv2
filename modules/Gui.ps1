@@ -201,3 +201,58 @@ function Start-InstallerUi {
         try { [System.Windows.Forms.MessageBox]::Show($summary, 'Resumo da instalacao') | Out-Null } catch { }
     }
 }
+
+# --- Menu principal (compartilhado por setup.ps1 e pelo bundle irm) ----------
+# Fica aqui (modulo empacotado) para o lancador 'irm | iex' poder abrir o MESMO
+# menu completo do setup.ps1, e nao apenas a tela de capacidades. Depende das
+# funcoes Invoke-*Menu dos modulos de area (ja carregados quando isto roda).
+function Show-MainMenu {
+    Clear-Host
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host "   Configurador Windows Server  -  $env:COMPUTERNAME" -ForegroundColor Cyan
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  CUSTOMIZACOES (Explorer / UI)"
+    Write-Host "    1) Aplicar TODAS as customizacoes (dark mode + extensoes + ocultos)"
+    Write-Host "    2) Ativar Dark Mode"
+    Write-Host "    3) Mostrar extensoes de arquivos"
+    Write-Host "    4) Mostrar arquivos ocultos"
+    Write-Host ""
+    Write-Host "  OUTRAS AREAS"
+    Write-Host "    5) IIS / Servidor Web"
+    Write-Host "    6) Funcoes/Recursos do Windows"
+    Write-Host "    7) Softwares / Runtimes"
+    Write-Host "    8) Config. base"
+    Write-Host ""
+    Write-Host "  INSTALACAO RAPIDA"
+    Write-Host "    9) Tela de capacidades (GUI ou console)"
+    Write-Host ""
+    Write-Host "    0) Sair"
+    Write-Host ""
+}
+
+function Start-MainMenu {
+    do {
+        Show-MainMenu
+        $opt = Read-Host "Escolha uma opcao"
+
+        switch ($opt) {
+            '1' { Invoke-AllCustomizations }
+            '2' { if (Enable-DarkMode)     { Restart-Explorer } }
+            '3' { if (Show-FileExtensions) { Restart-Explorer } }
+            '4' { if (Show-HiddenFiles)    { Restart-Explorer } }
+            '5' { Invoke-IISMenu }
+            '6' { Invoke-FeaturesMenu }
+            '7' { Invoke-SoftwareMenu }
+            '8' { Invoke-BaseConfigMenu }
+            '9' { Start-InstallerUi }
+            '0' { Write-Log "Saindo." -Level INFO }
+            default { Write-Host "Opcao invalida." -ForegroundColor Red }
+        }
+
+        if ($opt -ne '0') {
+            Write-Host ""
+            Read-Host "Pressione ENTER para voltar ao menu"
+        }
+    } while ($opt -ne '0')
+}
