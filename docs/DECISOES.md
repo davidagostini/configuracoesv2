@@ -43,7 +43,18 @@ entre sessões.
   (Server Core / headless / sem STA). Mesmo motor por baixo (`Common.ps1`).
 - A tela tem um campo **"Pasta de log"** configurável; cada ação grava o resultado lá. Gerar
   **um log por execução com timestamp** + salvar o **resumo final** na pasta escolhida.
-  (Implementação pendente: tornar `$Script:LogFile` configurável via `Set-LogDirectory`.)
+  Pasta de log padrão: **`C:\davidagostini\instalador\log\`** (decisão do usuário).
+  `Set-LogDirectory` (em `Common.ps1`) torna `$Script:LogFile` configurável. **Implementado.**
+
+## NetFx3 (.NET 3.5) e payload
+
+- O payload vem **do Windows** (WU/online por padrão). `Enable-OptionalFeatureSafe` aceita
+  `-Source`/`-LimitAccess` opcionais para apontar a mídia (`<unidade>\sources\sxs`) caso WU/WSUS
+  esteja bloqueado; sem `-Source`, tenta online. **Sem exigir mídia.**
+
+## Assinatura
+
+- Seguir **sem assinar** o `bootstrap.ps1` por ora (decisão do usuário). Bloqueio AMSI é ambiental.
 
 ## Repositório
 

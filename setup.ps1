@@ -25,10 +25,25 @@ $ErrorActionPreference = 'Stop'
 $id = [Security.Principal.WindowsIdentity]::GetCurrent()
 $pr = New-Object Security.Principal.WindowsPrincipal($id)
 if (-not $pr.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    # Resolve o proprio caminho sem depender so de $PSCommandPath (pode vir vazio).
+    $self = $PSCommandPath
+    if (-not $self) { $self = $MyInvocation.MyCommand.Path }
+    if (-not $self) { $self = $MyInvocation.MyCommand.Definition }
+
+    if (-not $self -or -not (Test-Path -LiteralPath $self -ErrorAction SilentlyContinue)) {
+        Write-Host "Nao foi possivel localizar o proprio arquivo para auto-elevar." -ForegroundColor Red
+        Write-Host "Abra o PowerShell como Administrador e rode:  .\setup.ps1" -ForegroundColor Yellow
+        exit 1
+    }
+
     Write-Host "Elevando privilegios (Administrador)..." -ForegroundColor Yellow
-    Start-Process -FilePath 'powershell.exe' `
-        -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" `
-        -Verb RunAs
+    try {
+        Start-Process -FilePath 'powershell.exe' `
+            -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',$self) `
+            -Verb RunAs
+    } catch {
+        Write-Host "Elevacao cancelada (UAC). Abortando." -ForegroundColor Yellow
+    }
     exit
 }
 

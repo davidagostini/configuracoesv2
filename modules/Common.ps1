@@ -5,7 +5,34 @@
 
 # --- Logging ---------------------------------------------------------------
 
-$Script:LogFile = Join-Path $PSScriptRoot '..\logs\install.log'
+# Pasta de log padrao do projeto (decisao do usuario). Usada quando rodando
+# via 'irm | iex' (sem disco/$PSScriptRoot) ou quando o usuario nao define outra.
+$Script:DefaultLogDir = 'C:\davidagostini\instalador\log'
+
+# Resolve a pasta de log inicial:
+#  - se $PSScriptRoot existe (dev local com modulos no disco) -> ..\logs
+#  - senao (irm|iex, bundle em memoria)                       -> pasta padrao
+if ($PSScriptRoot) {
+    $Script:LogFile = Join-Path $PSScriptRoot '..\logs\install.log'
+} else {
+    $Script:LogFile = Join-Path $Script:DefaultLogDir 'install.log'
+}
+
+# Define a pasta onde os logs serao gravados (campo "Pasta de log" da tela).
+# Gera um arquivo por execucao com timestamp passado pelo chamador, ou o
+# install.log padrao quando -FileName nao e informado.
+function Set-LogDirectory {
+    param(
+        [Parameter(Mandatory)] [string] $Path,
+        [string] $FileName = 'install.log'
+    )
+    if (-not $Path) { return }
+    if (-not (Test-Path $Path)) {
+        New-Item -ItemType Directory -Path $Path -Force | Out-Null
+    }
+    $Script:LogFile = Join-Path $Path $FileName
+    Write-Log "Pasta de log definida: $Path" -Level INFO
+}
 
 function Write-Log {
     param(
@@ -143,7 +170,12 @@ function Enable-OptionalFeatureSafe {
     param(
         [Parameter(Mandatory)] [string] $FeatureName,
         [string] $DisplayName,
-        [switch] $All
+        [switch] $All,
+        # NetFx3 e WCF non-45 sao FoD sem payload local: se a feature exigir e
+        # WU/WSUS estiver bloqueado, pode-se apontar -Source para a midia do
+        # Windows (ex.: D:\sources\sxs) com -LimitAccess. Sem -Source, tenta online.
+        [string] $Source,
+        [switch] $LimitAccess
     )
     if (-not $DisplayName) { $DisplayName = $FeatureName }
 
@@ -163,7 +195,16 @@ function Enable-OptionalFeatureSafe {
 
     try {
         Write-Log "Habilitando '$DisplayName' ($FeatureName)..." -Level STEP
-        $r = Enable-WindowsOptionalFeature -Online -FeatureName $FeatureName -All:$All -NoRestart -ErrorAction Stop
+        $eparams = @{
+            Online      = $true
+            FeatureName = $FeatureName
+            All         = $All
+            NoRestart   = $true
+            ErrorAction = 'Stop'
+        }
+        if ($Source)      { $eparams['Source']      = $Source }
+        if ($LimitAccess) { $eparams['LimitAccess'] = $true }
+        $r = Enable-WindowsOptionalFeature @eparams
         if ($r.RestartNeeded) {
             Write-Log "'$DisplayName' habilitada - REINICIO necessario para concluir." -Level WARN
             Add-FeatureResult -Name $DisplayName -Status 'PrecisaReinicio'
@@ -173,8 +214,13 @@ function Enable-OptionalFeatureSafe {
         }
     }
     catch {
-        Write-Log "Falha ao habilitar '$DisplayName': $($_.Exception.Message)" -Level ERRO
-        Add-FeatureResult -Name $DisplayName -Status 'Falha' -Detail $_.Exception.Message
+        $msg = $_.Exception.Message
+        Write-Log "Falha ao habilitar '$DisplayName': $msg" -Level ERRO
+        # 0x800F0954 / 0x800F081F: payload (FoD/NetFx3) ausente e WU/WSUS bloqueado.
+        if ($msg -match '0x800F0954|0x800F081F|0x800f0906') {
+            Write-Log "Dica: '$DisplayName' precisa do payload do Windows. Rode com a midia de instalacao: -Source <unidade>\sources\sxs -LimitAccess" -Level WARN
+        }
+        Add-FeatureResult -Name $DisplayName -Status 'Falha' -Detail $msg
     }
 }
 
