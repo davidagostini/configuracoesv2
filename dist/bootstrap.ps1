@@ -48,13 +48,14 @@ $hash = ([BitConverter]::ToString(
         )).Replace('-', '')
 
 # Pula a checagem se o hash nao foi baked (build local de teste deixa o placeholder).
+# ==== TEMPORARIO (a pedido, p/ testes): validacao SHA256 apenas AVISA, nao aborta.
+#      REATIVAR antes de publicar/pinar -> trocar o bloco abaixo de volta p/ 'return'.
 if ($PayloadSha -notmatch '^_' -and $hash -ne $PayloadSha) {
-    Write-Host "ERRO: SHA256 do payload nao confere." -ForegroundColor Red
-    Write-Host "  esperado: $PayloadSha" -ForegroundColor Red
-    Write-Host "  obtido:   $hash" -ForegroundColor Red
-    Write-Host "Abortando por seguranca." -ForegroundColor Red
-    return
+    Write-Host "AVISO: SHA256 do payload nao confere (validacao DESATIVADA p/ teste)." -ForegroundColor Yellow
+    Write-Host "  esperado: $PayloadSha" -ForegroundColor Yellow
+    Write-Host "  obtido:   $hash" -ForegroundColor Yellow
 }
+# ==== FIM TEMPORARIO
 
 $payload = [System.Text.Encoding]::UTF8.GetString($bytes).TrimStart([char]0xFEFF)
 Invoke-Expression $payload
