@@ -138,6 +138,258 @@ function Invoke-NatSwitchPrompt {
     else      { New-NatSwitch -SwitchName $name -Subnet $subnet -GatewayIP $gw }
 }
 
+# --- DHCP para o NAT Switch (somente Windows Server) ------------------------
+# Um NAT switch NAO distribui IP. Para as VMs pegarem IP automatico, instala-se
+# a role DHCP no proprio host e cria-se um scope na sub-rede do NAT, com bind
+# SOMENTE na interface do NAT (nunca responde na rede fisica). Detalhes e
+# diagnostico em docs/RUNBOOK-DHCP-NAT-HyperV.md.
+
+# DNS sugerido como default (editavel no prompt). 213.186.33.99 = DNS da OVH.
+$Script:DefaultNatDns = '213.186.33.99'
+
+# --- Helpers de IPv4 (calculo de mascara e faixas) -------------------------
+# Converte um IPv4 (string) para UInt32 (ordem logica big-endian).
+function ConvertTo-IPv4UInt32 {
+    param([Parameter(Mandatory)] [string] $IP)
+    $b = ([System.Net.IPAddress]::Parse($IP)).GetAddressBytes()
+    [array]::Reverse($b)
+    return [System.BitConverter]::ToUInt32($b, 0)
+}
+
+# Converte um UInt32 de volta para IPv4 (string).
+function ConvertFrom-IPv4UInt32 {
+    param([Parameter(Mandatory)] [uint32] $Value)
+    $b = [System.BitConverter]::GetBytes($Value)
+    [array]::Reverse($b)
+    return ([System.Net.IPAddress]::new($b)).ToString()
+}
+
+# Mascara pontilhada (ex.: 255.255.255.0) a partir do prefixo CIDR (ex.: 24).
+function Get-IPv4MaskFromPrefix {
+    param([Parameter(Mandatory)] [int] $PrefixLength)
+    if ($PrefixLength -le 0)  { return '0.0.0.0' }
+    if ($PrefixLength -ge 32) { return '255.255.255.255' }
+    # 0xFFFFFFFFL com sufixo L = Int64 positivo (sem L, PS le 0xFFFFFFFF como Int32 = -1).
+    $allOnes   = 0xFFFFFFFFL
+    $hostCount = [int64][math]::Pow(2, (32 - $PrefixLength))    # 2^hostBits
+    $mask = [uint32]($allOnes - ($hostCount - 1))
+    return (ConvertFrom-IPv4UInt32 -Value $mask)
+}
+
+# Descobre as redes NAT do Hyper-V e o IP do host (gateway) em cada uma.
+# Para cada Get-NetNat, parseia a sub-rede (InternalIPInterfaceAddressPrefix,
+# ex.: 172.16.3.0/24) e procura a interface do host cujo IP cai nessa sub-rede:
+# esse IP e o gateway que as VMs usam. Retorna candidatos com tudo pronto p/ o
+# scope (ScopeId, Mask, GatewayIP, InterfaceAlias).
+function Get-NatNetworkInfo {
+    if (-not (Get-Command Get-NetNat -ErrorAction SilentlyContinue)) { return @() }
+
+    $hostIps = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue)
+    $result = @()
+    foreach ($nat in (Get-NetNat -ErrorAction SilentlyContinue)) {
+        $prefix = $nat.InternalIPInterfaceAddressPrefix     # ex.: 172.16.3.0/24
+        if ($prefix -notmatch '^\s*(\d{1,3}(?:\.\d{1,3}){3})\s*/\s*(\d{1,2})\s*$') { continue }
+        $scopeId   = $Matches[1]
+        $prefixLen = [int]$Matches[2]
+        $mask      = Get-IPv4MaskFromPrefix -PrefixLength $prefixLen
+
+        $net = ConvertTo-IPv4UInt32 -IP $scopeId
+        $msk = ConvertTo-IPv4UInt32 -IP $mask
+        $gwIp = $null; $ifAlias = $null
+        foreach ($a in $hostIps) {
+            $ipU = ConvertTo-IPv4UInt32 -IP $a.IPAddress
+            if (($ipU -band $msk) -eq ($net -band $msk)) {
+                $gwIp = $a.IPAddress; $ifAlias = $a.InterfaceAlias; break
+            }
+        }
+
+        $result += [PSCustomObject]@{
+            NatName        = $nat.Name
+            ScopeId        = $scopeId
+            PrefixLength   = $prefixLen
+            Mask           = $mask
+            GatewayIP      = $gwIp
+            InterfaceAlias = $ifAlias
+        }
+    }
+    return $result
+}
+
+# Garante a role DHCP no host (somente Server). Retorna $true se ja esta pronta
+# para configurar (cmdlets disponiveis); $false se exigiu instalacao/reinicio ou
+# se o SO nao e Server. Segue as regras do projeto (-NoRestart, defere, registra).
+function Install-DhcpRoleForNat {
+    $name = 'DHCP Server'
+    if (-not (Get-OSRole).HasServerManager) {
+        Write-Log "DHCP para NAT so e suportado em Windows Server (role DHCP ausente neste SO)." -Level WARN
+        Add-FeatureResult -Name $name -Status 'Falha' -Detail 'Recurso somente para Windows Server'
+        return $false
+    }
+
+    $state = Get-WindowsFeature -Name DHCP -ErrorAction SilentlyContinue
+    if (-not ($state -and $state.Installed)) {
+        if (-not (Test-CanInstallOrDefer -Name $name)) { return $false }
+        Write-Log "Instalando a role DHCP (com ferramentas de gerenciamento)..." -Level STEP
+        $r = Install-WindowsFeature -Name DHCP -IncludeManagementTools -NoRestart
+        if (-not $r.Success) {
+            Write-Log "Falha ao instalar a role DHCP. ExitCode: $($r.ExitCode)" -Level ERRO
+            Add-FeatureResult -Name $name -Status 'Falha' -Detail "ExitCode $($r.ExitCode)"
+            return $false
+        }
+        Write-Log "Role DHCP instalada - REINICIO necessario para ativar cmdlets e servico." -Level WARN
+        Add-FeatureResult -Name $name -Status 'PrecisaReinicio' -Detail 'Reinicie e rode de novo para configurar o scope'
+        return $false
+    }
+
+    # Role instalada: os cmdlets de DHCP so existem apos o reinicio.
+    if (-not (Get-Command Add-DhcpServerv4Scope -ErrorAction SilentlyContinue)) {
+        Write-Log "Role DHCP presente mas os cmdlets nao estao disponiveis - reinicio pendente." -Level WARN
+        Add-FeatureResult -Name $name -Status 'PrecisaReinicio' -Detail 'Reinicie para ativar os cmdlets de DHCP'
+        return $false
+    }
+
+    Add-FeatureResult -Name $name -Status 'JaPresente'
+    return $true
+}
+
+# Configura o DHCP para uma rede NAT: servico Automatic + scope + exclusao do
+# gateway + opcoes 003 (gateway) e 006 (DNS) + bind SOMENTE na interface do NAT.
+# Idempotente. Ver docs/RUNBOOK-DHCP-NAT-HyperV.md.
+function Set-NatDhcpScope {
+    param(
+        [Parameter(Mandatory)] [string] $ScopeId,
+        [Parameter(Mandatory)] [string] $Mask,
+        [Parameter(Mandatory)] [string] $RangeFrom,
+        [Parameter(Mandatory)] [string] $RangeTo,
+        [Parameter(Mandatory)] [string] $Gateway,
+        [Parameter(Mandatory)] [string] $Dns,
+        [Parameter(Mandatory)] [string] $NatIface,
+        [int] $LeaseDays = 7300            # lease longo (20 anos) p/ as VMs nao renovarem
+    )
+    $display = "DHCP scope $ScopeId (NAT)"
+    try {
+        # 1) Servico
+        if ((Get-Service DHCPServer -ErrorAction Stop).Status -ne 'Running') { Start-Service DHCPServer }
+        Set-Service DHCPServer -StartupType Automatic
+
+        # 2) Scope (idempotente)
+        if (-not (Get-DhcpServerv4Scope -ScopeId $ScopeId -ErrorAction SilentlyContinue)) {
+            Add-DhcpServerv4Scope -Name 'NAT-VMs' -StartRange $RangeFrom -EndRange $RangeTo -SubnetMask $Mask -State Active
+            Write-Log "Scope $ScopeId criado ($RangeFrom - $RangeTo)." -Level OK
+        } else {
+            Write-Log "Scope $ScopeId ja existe - mantido." -Level OK
+        }
+
+        # 2b) Lease (opcao 051): lease longo deixa o IP "fixo na pratica" e evita
+        # as VMs ficarem renovando. Em try proprio: um cap de lease nao deve
+        # derrubar o resto da config. Ver runbook secao 7a.
+        try {
+            Set-DhcpServerv4Scope -ScopeId $ScopeId -LeaseDuration (New-TimeSpan -Days $LeaseDays)
+            Write-Log "Lease do scope $ScopeId definido em $LeaseDays dias." -Level OK
+        } catch {
+            Write-Log "Nao foi possivel definir o lease em $LeaseDays dias: $($_.Exception.Message)" -Level WARN
+        }
+
+        # 3) Exclui o gateway da distribuicao (seguranca)
+        Add-DhcpServerv4ExclusionRange -ScopeId $ScopeId -StartRange $Gateway -EndRange $Gateway -ErrorAction SilentlyContinue
+
+        # 4) Opcoes 003 (gateway) e 006 (DNS)
+        Set-DhcpServerv4OptionValue -ScopeId $ScopeId -Router $Gateway -DnsServer $Dns
+        Write-Log "Gateway (003)=$Gateway e DNS (006)=$Dns aplicados ao scope $ScopeId." -Level OK
+
+        # 5) Bind SOMENTE na interface do NAT (nunca na rede fisica)
+        Get-DhcpServerv4Binding | ForEach-Object {
+            if ($_.InterfaceAlias -eq $NatIface) {
+                if (-not $_.BindingState) { Set-DhcpServerv4Binding -InterfaceAlias $_.InterfaceAlias -BindingState $true }
+            } else {
+                if ($_.BindingState) { Set-DhcpServerv4Binding -InterfaceAlias $_.InterfaceAlias -BindingState $false }
+            }
+        }
+        Write-Log "DHCP vinculado somente a '$NatIface'." -Level OK
+
+        Restart-Service DHCPServer
+        Write-Log "DHCP configurado: as VMs no NAT $ScopeId agora pegam IP automatico." -Level OK
+        Add-FeatureResult -Name $display -Status 'Instalado' -Detail "range $RangeFrom-$RangeTo / gw $Gateway / dns $Dns"
+    }
+    catch {
+        Write-Log "Falha ao configurar o DHCP: $($_.Exception.Message)" -Level ERRO
+        Add-FeatureResult -Name $display -Status 'Falha' -Detail $_.Exception.Message
+    }
+}
+
+# Prompt interativo: instala a role (se preciso), DETECTA a rede NAT e o IP do
+# host (gateway) e os mostra, e pergunta faixa e DNS (OVH como default). Aplica
+# apos confirmacao.
+function Invoke-NatDhcpPrompt {
+    Write-Host ""
+    Write-Host "  --- Configurar DHCP para o NAT Switch (Windows Server) ---" -ForegroundColor Cyan
+
+    # 1) Garante a role DHCP. Se acabou de instalar / precisa reiniciar, para aqui.
+    if (-not (Install-DhcpRoleForNat)) {
+        Write-Host "  DHCP ainda nao esta pronto (ver mensagens acima)." -ForegroundColor Yellow
+        Write-Host "  Se foi solicitado reinicio, reinicie o servidor e rode esta opcao de novo." -ForegroundColor Yellow
+        return
+    }
+
+    # 2) Detecta as redes NAT e o IP do host (gateway) em cada uma.
+    $nets = @(Get-NatNetworkInfo | Where-Object { $_.GatewayIP })
+    if ($nets.Count -eq 0) {
+        Write-Host "  Nenhuma rede NAT com IP de host detectada." -ForegroundColor Yellow
+        Write-Host "  Crie antes um NAT Switch (opcao 3) ou verifique com 'Get-NetNat'." -ForegroundColor Yellow
+        return
+    }
+
+    # Escolha da rede NAT quando houver mais de uma.
+    $sel = $nets[0]
+    if ($nets.Count -gt 1) {
+        Write-Host "  Redes NAT detectadas:" -ForegroundColor Cyan
+        for ($i = 0; $i -lt $nets.Count; $i++) {
+            Write-Host ("    {0}) {1}/{2}  gateway {3}  via '{4}'" -f ($i + 1), $nets[$i].ScopeId, $nets[$i].PrefixLength, $nets[$i].GatewayIP, $nets[$i].InterfaceAlias)
+        }
+        $pick = (Read-Host "Escolha a rede (1-$($nets.Count), ENTER = 1)").Trim()
+        if ($pick) {
+            $idx = 0
+            if ([int]::TryParse($pick, [ref]$idx) -and $idx -ge 1 -and $idx -le $nets.Count) { $sel = $nets[$idx - 1] }
+        }
+    }
+
+    Write-Host ""
+    Write-Host "  Rede NAT detectada automaticamente:" -ForegroundColor Green
+    Write-Host ("    Sub-rede : {0}/{1}  (mascara {2})" -f $sel.ScopeId, $sel.PrefixLength, $sel.Mask)
+    Write-Host ("    Gateway  : {0}   (IP do host na interface '{1}')" -f $sel.GatewayIP, $sel.InterfaceAlias)
+    Write-Host ""
+
+    # 3) Faixa do DHCP - defaults derivados da sub-rede (.50 a .200 acima da rede).
+    $netU    = ConvertTo-IPv4UInt32 -IP $sel.ScopeId
+    $defFrom = ConvertFrom-IPv4UInt32 -Value ($netU + 50)
+    $defTo   = ConvertFrom-IPv4UInt32 -Value ($netU + 200)
+
+    $rFrom = (Read-Host "Faixa inicial (ENTER = $defFrom)").Trim(); if (-not $rFrom) { $rFrom = $defFrom }
+    $rTo   = (Read-Host "Faixa final   (ENTER = $defTo)").Trim();   if (-not $rTo)   { $rTo   = $defTo }
+
+    # 4) DNS - campo editavel, com a OVH pre-preenchida como default.
+    $dns = (Read-Host "DNS para as VMs (ENTER = $Script:DefaultNatDns)").Trim()
+    if (-not $dns) { $dns = $Script:DefaultNatDns }
+
+    # 5) Lease (opcao 051) - default longo p/ as VMs nao ficarem renovando.
+    $leaseDays = 7300
+    $leaseIn = (Read-Host "Duracao do lease em dias (ENTER = 7300 = 20 anos; 8 = padrao Windows)").Trim()
+    if ($leaseIn) { $tmp = 0; if ([int]::TryParse($leaseIn, [ref]$tmp) -and $tmp -gt 0) { $leaseDays = $tmp } }
+
+    # 6) Confirma e aplica.
+    Write-Host ""
+    Write-Host "  Resumo:" -ForegroundColor Cyan
+    Write-Host ("    Scope {0} / mascara {1} / range {2} - {3}" -f $sel.ScopeId, $sel.Mask, $rFrom, $rTo)
+    Write-Host ("    Gateway {0} / DNS {1} / lease {2} dias / bind em '{3}'" -f $sel.GatewayIP, $dns, $leaseDays, $sel.InterfaceAlias)
+    if (-not (Confirm-Action "Aplicar esta configuracao de DHCP?")) {
+        Write-Host "  Cancelado." -ForegroundColor Yellow
+        return
+    }
+
+    Set-NatDhcpScope -ScopeId $sel.ScopeId -Mask $sel.Mask -RangeFrom $rFrom -RangeTo $rTo `
+        -Gateway $sel.GatewayIP -Dns $dns -NatIface $sel.InterfaceAlias -LeaseDays $leaseDays
+}
+
 # --- Submenu de Features ----------------------------------------------------
 function Invoke-FeaturesMenu {
     Reset-FeatureSession
@@ -153,6 +405,7 @@ function Invoke-FeaturesMenu {
         Write-Host "    1) Instalar Hyper-V            [REQUER REINICIO]"
         Write-Host "    2) Habilitar Telnet Client"
         Write-Host "    3) Criar NAT Switch (Hyper-V)  [nome/sub-rede/gateway]"
+        Write-Host "    4) Configurar DHCP p/ o NAT    [Windows Server - detecta IP/DNS/lease]"
         Write-Host "    9) Ver resumo da sessao"
         Write-Host "    0) Voltar (mostra resumo)"
         Write-Host ""
@@ -162,6 +415,7 @@ function Invoke-FeaturesMenu {
             '1' { Install-HyperVRole }
             '2' { Enable-TelnetClientFeature }
             '3' { Invoke-NatSwitchPrompt }
+            '4' { Invoke-NatDhcpPrompt }
             '9' { Show-FeaturesSummary }
             '0' { }
             default { Write-Host "Opcao invalida." -ForegroundColor Red }
