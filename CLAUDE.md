@@ -49,9 +49,11 @@ Módulos (em `modules/`):
   console colorido), `Set-RegistryValue` (idempotente), o **controle de reinício/resultado**
   (`Test-PendingReboot`, `Test-CanInstallOrDefer`, `Add-FeatureResult`, `Show-FeaturesSummary`,
   `Enable-OptionalFeatureSafe`) e o **ledger persistente** (`installer-state.json`):
-  `Save-FeatureState` / `Get-FeatureStateLedger` / `Clear-FeatureState`. `Add-FeatureResult`
-  grava cada resultado no ledger para a aba "Status" saber, ao reabrir (inclusive após reboot),
-  o que já foi feito.
+  `Save-FeatureState` / `Get-FeatureStateLedger` / `Clear-FeatureState` + timers (`Start-FeatureTimer`)
+  e info de máquina (`Get-MachineInfo`, `Get-HostIPv4`). `Add-FeatureResult` grava **1 entrada por item**
+  com **snapshot da máquina** (nome/OS/IPs/reinício) + início/fim/duração, para a aba "Status" mostrar,
+  ao reabrir (inclusive após reboot), o que já foi feito. `Get-FeatureStateLedger` trata o gotcha do
+  `ConvertFrom-Json` no PS 5.1 (captura em variável + achata 1 nível, curando arquivos aninhados).
 - **`OSCommon.ps1`** — `Get-OSRole` (client vs server, Server Core, capacidade de GUI, cacheado em
   `$Script:OSRole`); o **catálogo de capacidades** (`$Script:CapabilityCatalog`) e o dispatch:
   `Get-AvailableCapabilities` (filtra por SO), `Install-Capability`, `Install-CapabilityServerRole`,
@@ -70,10 +72,14 @@ Módulos (em `modules/`):
   winget; `Install-Chocolatey` faz bootstrap.
 - **`Gui.ps1`** — fallback de console e o **menu principal**: `Start-MainMenu` / `Show-MainMenu`,
   `Show-InstallerGui` (WinForms), `Show-InstallerConsole`, `Start-InstallerUi`, `Get-SummaryText`.
-- **`GuiWpf.ps1`** — **UI primária**: janela **WPF** estilo app, abas (Status, Features, Softwares,
-  IIS, Rede NAT/DHCP, Customizações, Config base). `Start-Gui` tenta WPF e cai para `Start-MainMenu`
-  (console) sem WPF (Server Core/headless/não-STA). Janela fica aberta (sessão iterativa); **cada
-  "Aplicar" pede confirmação** (Sim/Não) e desabilita os botões durante a execução.
+- **`GuiWpf.ps1`** — **UI primária**: janela **WPF** estilo app, tema escuro, **ícone próprio**
+  (`New-AppIconImage`, avatar desenhado em runtime). Abas (Status, Features, Softwares, IIS, Rede
+  NAT/DHCP, Customizações, Config base). `Start-Gui` tenta WPF e cai para `Start-MainMenu` (console)
+  sem WPF (Server Core/headless/não-STA). Janela fica aberta (sessão iterativa); **cada "Aplicar"
+  pede confirmação listando os itens** e desabilita os botões durante a execução; **a lista é
+  repopulada após aplicar** (limpa seleção) e marca itens já instalados com **"[instalado]"** (verde),
+  lendo o ledger (`Get-InstalledStateMap`). Execução é **síncrona** (congela em operações longas;
+  async é pendência).
 
 ## Convenções e invariantes (NÃO quebrar)
 
@@ -126,6 +132,7 @@ ou `-Ref <commitSHA>`; 4. commit; 5. `git tag -a vX.Y.Z`; 6. push commit + tag. 
 Durante o desenvolvimento, testa-se com `-Ref main` (mutável).
 
 Decisões e divergências de design estão em `docs/DECISOES.md` e `docs/DESIGN-irm-gui.md`.
+**Estado atual + pendências + como retomar (inclusive após formatar)**: `docs/ESTADO-ATUAL.md`.
 
 ## Repositório
 

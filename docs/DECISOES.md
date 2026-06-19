@@ -53,10 +53,14 @@ entre sessões.
   A WinForms (`Show-InstallerGui`) vira a tela de capacidades do menu de console. Mesmo motor
   por baixo (`Common.ps1`).
 - **Janela aberta / iterativa**: cada aba tem seu "Aplicar"; a janela não fecha entre ações.
-- **Confirmação por ação**: todo "Aplicar" pede Sim/Não e os botões são desabilitados durante a
-  execução. Motivo: a execução é **síncrona** (a janela congela em operações longas, com o log no
-  console); sem isso, um clique enfileirado disparava ação por engano (chegou a iniciar o IIS sozinho).
-  **Pendente:** execução assíncrona (runspace) para não congelar.
+- **Confirmação por ação**: todo "Aplicar" pede Sim/Não **listando os itens** que vão rodar, e os
+  botões são desabilitados durante a execução. Motivo: a execução é **síncrona** (a janela congela em
+  operações longas, com o log no console); sem isso, um clique enfileirado disparava ação por engano
+  (chegou a iniciar o IIS sozinho) e seleção antiga reentrava. **Pendente:** execução assíncrona (runspace).
+- **Ícone próprio**: a janela usa um avatar desenhado em runtime (`New-AppIconImage`, GDI+ →
+  BitmapSource) no lugar do ícone do PowerShell. PNG/ICO de referência em `docs/app-icon.*`.
+- **Detalhe de erro**: falha de choco/winget grava o trecho final da saída no log + resumo curto no
+  Detail (`Get-OutputTail` / `Get-ErrorDetail`) e aponta o log do choco.
 - A tela tem um campo **"Pasta de log"** configurável; cada ação grava o resultado lá. Gerar
   **um log por execução com timestamp** + salvar o **resumo final** na pasta escolhida.
   Pasta de log padrão: **`C:\davidagostini\instalador\log\`** (decisão do usuário).
@@ -64,10 +68,16 @@ entre sessões.
 
 ## Estado persistente / retomada após reinício
 
-- **Ledger `installer-state.json`** (na pasta de log): `Add-FeatureResult` grava cada resultado
-  (Name/Status/Detail/Timestamp, upsert por Name). A aba **"Status"** lê isso ao abrir — inclusive
-  **após um reinício** — e mostra o que foi feito / precisa reinício / ficou deferido, com **aviso
-  de reinício pendente** (`Test-PendingReboot`). Botões Atualizar e Limpar histórico.
+- **Ledger `installer-state.json`** (na pasta de log): `Add-FeatureResult` grava **1 entrada por
+  item** (upsert por Name) com **snapshot da máquina** (nome/OS/IPs/reinício) + **início/fim/duração**
+  — material de diagnóstico mesmo se nome/IP mudarem entre execuções. A aba **"Status"** lê ao abrir
+  (inclusive após reinício) e mostra o que foi feito / precisa reinício / deferido, com **aviso de
+  reinício pendente** e cabeçalho ao vivo (máquina/OS/IPs). Botões Atualizar e Limpar histórico.
+- **Marcação inline**: itens já instalados aparecem **"[instalado <data>]" (verde) ao lado** do
+  checkbox em Features/Softwares/IIS (lido do ledger), e a lista é **repopulada após cada Aplicar**.
+- **Bug corrigido (importante)**: a leitura `@($raw | ConvertFrom-Json)` aninhava o array com 2+
+  itens no PS 5.1 (lia 1 em vez de N) — por isso nada aparecia como instalado após instalar vários,
+  e o arquivo corrompia. Fix: captura em variável + **achata 1 nível** (auto-cura arquivos aninhados).
 - A retomada de fato continua sendo a **idempotência**: rodar de novo pula o que já está feito; o
   ledger é o "painel" do que aconteceu, não um motor de replay.
 
