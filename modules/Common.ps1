@@ -137,13 +137,35 @@ function Start-FeatureTimer {
     $Script:FeatureTimers[$Name] = (Get-Date)
 }
 
-# Nome/OS da maquina (cacheados) para o cabecalho do ledger.
+# Detecta se a maquina e FISICA ou VIRTUAL (cacheado). Olha fabricante/modelo do
+# Win32_ComputerSystem + BIOS; cobre VMware, Hyper-V, KVM/QEMU (ex.: VPS OVH),
+# VirtualBox, Xen, Parallels, GCP/OpenStack, etc. Um HOST fisico com a role Hyper-V
+# continua 'Fisica' (o ComputerSystem reflete o hardware real, nao o hypervisor).
+$Script:MachineKind = $null
+function Get-MachineKind {
+    if ($Script:MachineKind) { return $Script:MachineKind }
+    $kind = 'Desconhecido'
+    try {
+        $cs   = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+        $bios = Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue
+        $hay  = "$($cs.Manufacturer) $($cs.Model) $($bios.Manufacturer) $($bios.Version) $($bios.SerialNumber)"
+        if ($hay -match 'VMware|VirtualBox|Virtual Machine|Hyper-V|KVM|QEMU|Bochs|Xen|HVM domU|Parallels|Google Compute|OpenStack|oVirt|RHEV|innotek') {
+            $kind = 'Virtual'
+        } else {
+            $kind = 'Fisica'
+        }
+    } catch { $kind = 'Desconhecido' }
+    $Script:MachineKind = $kind
+    return $kind
+}
+
+# Nome/OS/tipo da maquina (cacheados) para o cabecalho do ledger.
 $Script:MachineInfo = $null
 function Get-MachineInfo {
     if (-not $Script:MachineInfo) {
         $os = ''
         try { $os = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).Caption } catch { }
-        $Script:MachineInfo = [PSCustomObject]@{ Machine = $env:COMPUTERNAME; OS = $os }
+        $Script:MachineInfo = [PSCustomObject]@{ Machine = $env:COMPUTERNAME; OS = $os; Kind = (Get-MachineKind) }
     }
     return $Script:MachineInfo
 }
@@ -219,6 +241,7 @@ function Save-FeatureState {
             Timestamp     = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
             Machine       = $mi.Machine
             OS            = $mi.OS
+            MachineKind   = $mi.Kind
             IPv4          = @(Get-HostIPv4)
             RebootPending = [bool](Test-PendingReboot)
         }

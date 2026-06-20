@@ -44,6 +44,13 @@
 - **DHCP do NAT** (Server): role + scope + gateway/DNS/lease + bind so no NAT.
   Runbook em `docs/RUNBOOK-DHCP-NAT-HyperV.md` + script `configurar-dhcp-nat.ps1`.
 - **Detalhe de erro** de choco/winget gravado no log + resumo.
+- **Novidades (jun/2026):** ajuste de hora **por HTTP** (cabecalho Date, sem NTP); deteccao
+  **fisica/virtual** no ledger (`Get-MachineKind`); aba **Sistema** (Customizacoes + Config base
+  unificadas) com marca **"[feito em <data>]" clicavel -> popup do JSON** do item (em todas as abas);
+  aba **Atualizacoes** (winget upgrade / choco outdated + atualizar tudo, inclui apps externos);
+  **OpenSSH Server** (sshd + firewall 22), **`wsl --update`**, **PowerShell 7** no catalogo,
+  desativar **Print Screen** do Snipping e abrir as pastas **Startup**. Hyper-V mantido **OS-aware**
+  (Win11=DISM; Server=Install-WindowsFeature, sem `-Restart`).
 
 ## Arquivos de runtime (NAO versionados; ficam na maquina alvo)
 

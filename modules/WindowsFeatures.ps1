@@ -56,6 +56,77 @@ function Enable-TelnetClientFeature {
     Enable-OptionalFeatureSafe -FeatureName 'TelnetClient' -DisplayName 'Telnet Client'
 }
 
+# --- OpenSSH Server ---------------------------------------------------------
+# Instala a capability OpenSSH.Server (FoD), poe o servico sshd em Automatico,
+# sobe o servico e garante a regra de firewall na porta 22. Idempotente.
+function Install-OpenSSHServer {
+    $name = 'OpenSSH Server'
+    Write-Log "Verificando/instalando o OpenSSH Server..." -Level STEP
+
+    $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $cap) {
+        Write-Log "Capability OpenSSH.Server nao encontrada neste SO." -Level ERRO
+        Add-FeatureResult -Name $name -Status 'Falha' -Detail 'Capability ausente'
+        return
+    }
+
+    if ($cap.State -eq 'Installed') {
+        Write-Log "OpenSSH Server ja esta instalado." -Level OK
+        Add-FeatureResult -Name $name -Status 'JaPresente'
+    } else {
+        if (-not (Test-CanInstallOrDefer -Name $name)) { return }
+        Start-FeatureTimer -Name $name
+        try {
+            Write-Log "Instalando $($cap.Name)..." -Level STEP
+            Add-WindowsCapability -Online -Name $cap.Name -ErrorAction Stop | Out-Null
+            Write-Log "OpenSSH Server instalado." -Level OK
+            Add-FeatureResult -Name $name -Status 'Instalado'
+        } catch {
+            Write-Log "Falha ao instalar o OpenSSH Server: $($_.Exception.Message)" -Level ERRO
+            Add-FeatureResult -Name $name -Status 'Falha' -Detail $_.Exception.Message
+            return
+        }
+    }
+
+    # Pos-config: servico em Automatico + iniciado + firewall na 22.
+    try {
+        Set-Service -Name sshd -StartupType Automatic -ErrorAction Stop
+        if ((Get-Service sshd -ErrorAction Stop).Status -ne 'Running') { Start-Service sshd }
+        Write-Log "Servico sshd em Automatico e em execucao." -Level OK
+        if (-not (Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue)) {
+            New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' `
+                -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 | Out-Null
+            Write-Log "Regra de firewall criada (TCP 22)." -Level OK
+        } else {
+            Write-Log "Regra de firewall para a porta 22 ja existe." -Level OK
+        }
+    } catch {
+        Write-Log "OpenSSH instalado, mas houve problema ao configurar o servico/firewall: $($_.Exception.Message)" -Level WARN
+    }
+}
+
+# --- WSL (atualizacao do kernel/componentes) -------------------------------
+# Roda 'wsl --update'. Nao instala distro; so atualiza o WSL ja presente no SO.
+function Update-Wsl {
+    $name = 'WSL (update)'
+    Write-Log "Atualizando o WSL (wsl --update)..." -Level STEP
+    if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
+        Write-Log "wsl.exe nao encontrado neste SO." -Level WARN
+        Add-FeatureResult -Name $name -Status 'Falha' -Detail 'wsl.exe ausente'
+        return
+    }
+    Start-FeatureTimer -Name $name
+    & wsl.exe --update 2>&1 | Tee-Object -Variable out | Out-Null
+    $code = $LASTEXITCODE
+    if ($code -eq 0 -or $null -eq $code) {
+        Write-Log "WSL atualizado (ou ja estava na ultima versao)." -Level OK
+        Add-FeatureResult -Name $name -Status 'Instalado'
+    } else {
+        Write-Log "wsl --update retornou ExitCode $code." -Level WARN
+        Add-FeatureResult -Name $name -Status 'Falha' -Detail "ExitCode $code"
+    }
+}
+
 # --- NAT Switch (Hyper-V) ---------------------------------------------------
 # Cria: (1) switch virtual Interno, (2) IP de gateway na vEthernet do switch,
 # (3) NAT na sub-rede. Nome, sub-rede (CIDR) e gateway sao informados pelo
@@ -417,6 +488,8 @@ function Invoke-FeaturesMenu {
         Write-Host "    2) Habilitar Telnet Client"
         Write-Host "    3) Criar NAT Switch (Hyper-V)  [nome/sub-rede/gateway]"
         Write-Host "    4) Configurar DHCP p/ o NAT    [Windows Server - detecta IP/DNS/lease]"
+        Write-Host "    5) Instalar OpenSSH Server     [servico sshd + firewall 22]"
+        Write-Host "    6) Atualizar o WSL             [wsl --update]"
         Write-Host "    9) Ver resumo da sessao"
         Write-Host "    0) Voltar (mostra resumo)"
         Write-Host ""
@@ -427,6 +500,8 @@ function Invoke-FeaturesMenu {
             '2' { Enable-TelnetClientFeature }
             '3' { Invoke-NatSwitchPrompt }
             '4' { Invoke-NatDhcpPrompt }
+            '5' { Install-OpenSSHServer }
+            '6' { Update-Wsl }
             '9' { Show-FeaturesSummary }
             '0' { }
             default { Write-Host "Opcao invalida." -ForegroundColor Red }

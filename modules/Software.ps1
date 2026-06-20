@@ -103,6 +103,7 @@ $Script:SoftwareCatalog = @(
     (New-Pkg 'jdk17'         'OpenJDK 17 (17.0.2)'     'Runtime'    'openjdk' 'Microsoft.OpenJDK.17' @('--version=17.0.2'))
     (New-Pkg 'maven'         'Apache Maven'            'Runtime'    'maven' '' @() @() 'no' 'Sem pacote winget; usa choco')
     (New-Pkg 'nodejs'        'Node.js'                 'Runtime'    'nodejs' 'OpenJS.NodeJS')
+    (New-Pkg 'pwsh'          'PowerShell 7'            'Runtime'    'powershell-core' 'Microsoft.PowerShell')
 
     # IDEs
     (New-Pkg 'vs2022'        'Visual Studio 2022 Community' 'IDE'   'visualstudio2022community' 'Microsoft.VisualStudio.2022.Community' @() @() 'no' 'Download grande')
@@ -291,6 +292,49 @@ function Update-AllChoco {
     Write-Log "Executando 'choco upgrade all -y'..." -Level STEP
     & choco upgrade all -y --no-progress
     Write-Log "choco upgrade all concluido (ExitCode $LASTEXITCODE)." -Level OK
+}
+
+# ============================================================================
+#  Atualizacoes pendentes (winget + choco) - inclui apps NAO instalados por
+#  esta ferramenta. As funcoes Get-* devolvem a saida como TEXTO (para a aba
+#  "Atualizacoes" exibir) e registram no log; as Update-* aplicam tudo.
+# ============================================================================
+
+# Lista o que o winget tem para atualizar (texto). --include-unknown traz tambem
+# pacotes cuja versao instalada o winget nao consegue determinar.
+function Get-WingetUpgrades {
+    if (-not (Test-WingetAvailable)) {
+        Write-Log "winget nao encontrado neste SO." -Level WARN
+        return 'winget nao encontrado neste SO.'
+    }
+    Write-Log "Listando atualizacoes pendentes (winget upgrade)..." -Level STEP
+    $out = & winget upgrade --include-unknown --accept-source-agreements 2>&1 | ForEach-Object { "$_" }
+    Write-Log "winget: lista de pendentes obtida." -Level OK
+    return (($out | Where-Object { $_ -match '\S' }) -join [Environment]::NewLine)
+}
+
+# Lista o que o choco tem para atualizar (texto).
+function Get-ChocoOutdated {
+    if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+        Write-Log "Chocolatey nao instalado." -Level WARN
+        return 'Chocolatey nao instalado (instale na aba Softwares).'
+    }
+    Write-Log "Listando atualizacoes pendentes (choco outdated)..." -Level STEP
+    $out = & choco outdated 2>&1 | ForEach-Object { "$_" }
+    Write-Log "choco: lista de pendentes obtida." -Level OK
+    return (($out | Where-Object { $_ -match '\S' }) -join [Environment]::NewLine)
+}
+
+# Atualiza TUDO que o winget conhece (inclui apps de fora da ferramenta).
+function Update-AllWinget {
+    if (-not (Test-WingetAvailable)) {
+        Write-Log "winget nao encontrado neste SO." -Level WARN
+        return
+    }
+    Write-Log "Executando 'winget upgrade --all'..." -Level STEP
+    & winget upgrade --all --include-unknown --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1 |
+        Tee-Object -Variable out | Out-Null
+    Write-Log "winget upgrade --all concluido (ExitCode $LASTEXITCODE)." -Level OK
 }
 
 # --- Submenu de Softwares ---------------------------------------------------

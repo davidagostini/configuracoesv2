@@ -44,27 +44,54 @@ function Set-TimeZoneBrasilia {
     Write-Log "Time zone alterado de '$current' para Brasilia." -Level OK
 }
 
-# --- Ajustar data/hora atual (sincronizacao NTP) ---------------------------
+# --- Ajustar data/hora atual (via internet / cabecalho HTTP "Date") --------
+# O NTP (porta UDP 123) costuma vir BLOQUEADO em datacenter/firewall, entao em
+# vez de w32tm pegamos a hora do cabecalho HTTP "Date" (HTTPS/443, quase sempre
+# liberado), convertemos para a hora local da TZ atual e aplicamos com Set-Date.
+# IMPORTANTE: Set-Date grava HORA LOCAL; configure a TZ para Brasilia
+# (Set-TimeZoneBrasilia) ANTES para o relogio ficar exatamente em UTC-3.
+# Retorna $true se ajustou, $false em falha (nao lanca excecao).
 function Sync-DateTime {
-    Write-Log "Configurando e sincronizando o relogio (NTP)..." -Level STEP
+    param(
+        [string[]] $Urls = @('https://www.google.com', 'https://www.cloudflare.com', 'https://www.microsoft.com')
+    )
+    Write-Log "Ajustando o relogio pela hora da internet (cabecalho HTTP Date)..." -Level STEP
 
-    # Servidores NTP do NTP.br + fallback Microsoft (0x8 = client mode)
-    $peers = 'a.st1.ntp.br,0x8 b.st1.ntp.br,0x8 time.windows.com,0x8'
+    $utc = $null
+    foreach ($u in $Urls) {
+        try {
+            $resp = Invoke-WebRequest -Uri $u -Method Head -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
+            $httpDate = $resp.Headers['Date']
+            if (-not $httpDate) { $httpDate = $resp.Headers.Date }
+            if ($httpDate) {
+                # DateTimeOffset entende o "GMT" do cabecalho; .UtcDateTime = hora UTC exata.
+                $utc = [System.DateTimeOffset]::Parse([string]$httpDate, [System.Globalization.CultureInfo]::InvariantCulture).UtcDateTime
+                Write-Log "Hora obtida de $u  (UTC $($utc.ToString('yyyy-MM-dd HH:mm:ss')))." -Level INFO
+                break
+            }
+        }
+        catch {
+            Write-Log "Nao deu para obter a hora de ${u}: $($_.Exception.Message)" -Level WARN
+        }
+    }
+
+    if (-not $utc) {
+        Write-Log "Falha: nenhuma URL retornou o cabecalho Date. Relogio NAO ajustado." -Level ERRO
+        return $false
+    }
 
     try {
-        Set-Service -Name w32time -StartupType Automatic
-        Start-Service -Name w32time -ErrorAction SilentlyContinue
-
-        # Em maquina fora de dominio, define a lista manual de servidores
-        & w32tm.exe /config /manualpeerlist:"$peers" /syncfromflags:manual /update | Out-Null
-        Restart-Service -Name w32time
-        Start-Sleep -Seconds 2
-        & w32tm.exe /resync /force | Out-Null
-
-        Write-Log "Relogio sincronizado. Hora atual: $((Get-Date).ToString('dd/MM/yyyy HH:mm:ss'))" -Level OK
+        # Converte o UTC para a hora local da TZ atual do Windows. Com a TZ em
+        # Brasilia isso da exatamente UTC-3 (equivalente a subtrair 3h na mao,
+        # porem sem fixar o fuso: fica certo mesmo se a TZ for outra).
+        $local = $utc.ToLocalTime()
+        Set-Date -Date $local -ErrorAction Stop | Out-Null
+        Write-Log "Relogio ajustado: $((Get-Date).ToString('dd/MM/yyyy HH:mm:ss'))  (TZ: $((Get-TimeZone).Id))." -Level OK
+        return $true
     }
     catch {
-        Write-Log "Falha ao sincronizar o relogio: $($_.Exception.Message)" -Level ERRO
+        Write-Log "Falha ao aplicar a data/hora: $($_.Exception.Message)" -Level ERRO
+        return $false
     }
 }
 
@@ -108,12 +135,12 @@ function Invoke-BaseConfigMenu {
             '1' {
                 Disable-IEEsc
                 Set-TimeZoneBrasilia
-                Sync-DateTime
+                Sync-DateTime | Out-Null
                 Disable-ServerManagerAutoStart
             }
             '2' { Disable-IEEsc }
             '3' { Set-TimeZoneBrasilia }
-            '4' { Sync-DateTime }
+            '4' { Sync-DateTime | Out-Null }
             '5' { Disable-ServerManagerAutoStart }
             '0' { }
             default { Write-Host "Opcao invalida." -ForegroundColor Red }

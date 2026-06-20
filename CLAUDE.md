@@ -50,8 +50,8 @@ Módulos (em `modules/`):
   (`Test-PendingReboot`, `Test-CanInstallOrDefer`, `Add-FeatureResult`, `Show-FeaturesSummary`,
   `Enable-OptionalFeatureSafe`) e o **ledger persistente** (`installer-state.json`):
   `Save-FeatureState` / `Get-FeatureStateLedger` / `Clear-FeatureState` + timers (`Start-FeatureTimer`)
-  e info de máquina (`Get-MachineInfo`, `Get-HostIPv4`). `Add-FeatureResult` grava **1 entrada por item**
-  com **snapshot da máquina** (nome/OS/IPs/reinício) + início/fim/duração, para a aba "Status" mostrar,
+  e info de máquina (`Get-MachineInfo`, `Get-MachineKind`, `Get-HostIPv4`). `Add-FeatureResult` grava **1 entrada por item**
+  com **snapshot da máquina** (nome/OS/**tipo física-ou-virtual**/IPs/reinício) + início/fim/duração, para a aba "Status" mostrar,
   ao reabrir (inclusive após reboot), o que já foi feito. `Get-FeatureStateLedger` trata o gotcha do
   `ConvertFrom-Json` no PS 5.1 (captura em variável + achata 1 nível, curando arquivos aninhados).
 - **`OSCommon.ps1`** — `Get-OSRole` (client vs server, Server Core, capacidade de GUI, cacheado em
@@ -59,7 +59,9 @@ Módulos (em `modules/`):
   `Get-AvailableCapabilities` (filtra por SO), `Install-Capability`, `Install-CapabilityServerRole`,
   `Invoke-CapabilityInstall`.
 - **`Customizations.ps1`** — dark mode, mostrar extensões e ocultos (registro `HKCU`).
-- **`WindowsFeatures.ps1`** — Hyper-V (OS-aware), Telnet Client, **NAT Switch** (`New-NatSwitch`) e
+- **`WindowsFeatures.ps1`** — Hyper-V (OS-aware), Telnet Client, **OpenSSH Server**
+  (`Install-OpenSSHServer`: capability + serviço sshd Automatico + firewall TCP 22), **WSL**
+  (`Update-Wsl` = `wsl --update`), **NAT Switch** (`New-NatSwitch`) e
   **DHCP para o NAT** (só Server): `Install-DhcpRoleForNat`, `Get-NatNetworkInfo` (detecta a rede NAT
   e o IP do host = gateway), `Set-NatDhcpScope` (scope + gateway/DNS/lease + bind SÓ na interface do
   NAT), `Invoke-NatDhcpPrompt`. Helpers IPv4: `ConvertTo/From-IPv4UInt32`, `Get-IPv4MaskFromPrefix`.
@@ -74,7 +76,9 @@ Módulos (em `modules/`):
   `Show-InstallerGui` (WinForms), `Show-InstallerConsole`, `Start-InstallerUi`, `Get-SummaryText`.
 - **`GuiWpf.ps1`** — **UI primária**: janela **WPF** estilo app, tema escuro, **ícone próprio**
   (`New-AppIconImage`, avatar desenhado em runtime). Abas (Status, Features, Softwares, IIS, Rede
-  NAT/DHCP, Customizações, Config base). `Start-Gui` tenta WPF e cai para `Start-MainMenu` (console)
+  NAT/DHCP, **Sistema** = Customizações+Config base unificadas, **Atualizações** = pendências
+  winget/choco mesmo de apps externos). Cada item já feito mostra **"[feito em <data>]"** ao lado;
+  clicar nessa marca abre um **popup com o registro (JSON)** daquele item. `Start-Gui` tenta WPF e cai para `Start-MainMenu` (console)
   sem WPF (Server Core/headless/não-STA). Janela fica aberta (sessão iterativa); **cada "Aplicar"
   pede confirmação listando os itens** e desabilita os botões durante a execução; **a lista é
   repopulada após aplicar** (limpa seleção) e marca itens já instalados com **"[instalado]"** (verde),

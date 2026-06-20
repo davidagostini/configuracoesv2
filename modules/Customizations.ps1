@@ -47,12 +47,33 @@ function Show-HiddenFiles {
     return $changed
 }
 
+# --- Desativar Print Screen abrindo a Ferramenta de Captura ----------------
+# Tira o atalho que faz a tecla PrintScreen abrir o Snipping Tool (HKCU).
+function Disable-PrintScreenSnipping {
+    Write-Log "Desvinculando a tecla Print Screen da Ferramenta de Captura..." -Level STEP
+    return (Set-RegistryValue -Path 'HKCU:\Software\Microsoft\Ease of Access\Keyboard' -Name 'PrintScreenKeyForSnippingEnabled' -Value 0 -Type DWord)
+}
+
+# --- Abrir as pastas de Inicializacao (Startup) ----------------------------
+# shell:startup = do usuario atual ; shell:common startup = de todos os usuarios.
+function Open-StartupFolders {
+    param([switch] $AllUsers)
+    if ($AllUsers) {
+        Write-Log "Abrindo a pasta Startup de todos os usuarios (shell:common startup)..." -Level STEP
+        Start-Process explorer.exe 'shell:common startup'
+    } else {
+        Write-Log "Abrindo a pasta Startup do usuario (shell:startup)..." -Level STEP
+        Start-Process explorer.exe 'shell:startup'
+    }
+}
+
 # --- Aplica todas as customizacoes de uma vez ------------------------------
 function Invoke-AllCustomizations {
     $changed = $false
     if (Enable-DarkMode)        { $changed = $true }
     if (Show-FileExtensions)    { $changed = $true }
     if (Show-HiddenFiles)       { $changed = $true }
+    Disable-PrintScreenSnipping | Out-Null   # nao depende do Explorer; aplica direto
 
     if ($changed) {
         Restart-Explorer

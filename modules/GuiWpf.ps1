@@ -8,6 +8,8 @@
 #  (evita clique enfileirado disparar acao por engano enquanto a UI esta ocupada).
 #  Operacoes longas rodam de forma sincrona - a janela pode ficar momentaneamente
 #  irresponsiva; o log ao vivo sai no console.
+#  Cada item ja instalado mostra "[feito em <data>]" ao lado (verde); clicar nessa
+#  marca abre um popup com o registro (JSON) daquele item do ledger.
 #  Aba "Status" le o ledger persistente (installer-state.json) e mostra, ao abrir
 #  (inclusive apos reinicio), o que ja foi feito / precisa de reinicio / deferido.
 #  Sem WPF (Server Core / headless / nao-STA): cai para Start-MainMenu.
@@ -100,20 +102,69 @@ function New-WpfHeader {
     return $tb
 }
 
+# Popup generico com texto monoespacado (read-only). Usado p/ mostrar o JSON
+# de um item do ledger e a saida das verificacoes de atualizacao.
+function Show-TextPopup {
+    param([string] $Title, [string] $Text, $Owner)
+    $x = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Detalhe" Height="440" Width="600" WindowStartupLocation="CenterOwner"
+        Background="#FF1E1E1E">
+  <DockPanel Margin="10">
+    <Button x:Name="btnOk" Content="Fechar" DockPanel.Dock="Bottom" Width="100" Height="30"
+            HorizontalAlignment="Right" Margin="0,8,0,0" Background="#FF0E639C" Foreground="White"/>
+    <TextBox x:Name="txt" IsReadOnly="True" TextWrapping="NoWrap" FontFamily="Consolas"
+             VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
+             Background="#FF2D2D30" Foreground="#FFEEEEEE" BorderBrush="#FF3F3F46"/>
+  </DockPanel>
+</Window>
+'@
+    [xml]$xml = $x
+    $rd = New-Object System.Xml.XmlNodeReader $xml
+    $w = [Windows.Markup.XamlReader]::Load($rd)
+    $w.Title = $Title
+    if ($Owner) { $w.Owner = $Owner }
+    $w.FindName('txt').Text = $Text
+    $w.FindName('btnOk').Add_Click({ $w.Close() }.GetNewClosure())
+    $null = $w.ShowDialog()
+}
+
+# Acha o item do ledger pelo Name e mostra o registro (JSON) num popup.
+function Show-LedgerJsonPopup {
+    param([string] $Name, $Owner)
+    $item = @(Get-FeatureStateLedger | Where-Object { [string]$_.Name -eq $Name }) | Select-Object -First 1
+    if (-not $item) {
+        [System.Windows.MessageBox]::Show("Sem registro no historico para: $Name", 'Detalhe') | Out-Null
+        return
+    }
+    Show-TextPopup -Title "Registro: $Name" -Text ($item | ConvertTo-Json -Depth 5) -Owner $Owner
+}
+
+# Coleta os CheckBox de um painel, sejam filhos diretos ou dentro das "linhas"
+# (StackPanel [checkbox][marca clicavel]) criadas por New-WpfItemRow.
+function Get-PanelCheckBoxes {
+    param($Panel)
+    $list = @()
+    foreach ($ch in $Panel.Children) {
+        if ($ch -is [System.Windows.Controls.CheckBox]) { $list += $ch }
+        elseif ($ch -is [System.Windows.Controls.Panel]) {
+            foreach ($g in $ch.Children) { if ($g -is [System.Windows.Controls.CheckBox]) { $list += $g } }
+        }
+    }
+    return $list
+}
+
 function Get-WpfCheckedTags {
     param($Panel)
     $out = @()
-    foreach ($ch in $Panel.Children) {
-        if ($ch -is [System.Windows.Controls.CheckBox] -and $ch.IsChecked) { $out += $ch.Tag }
-    }
+    foreach ($cb in (Get-PanelCheckBoxes $Panel)) { if ($cb.IsChecked) { $out += $cb.Tag } }
     return $out
 }
 
 function Set-WpfAllChecks {
     param($Panel, [bool] $Value)
-    foreach ($ch in $Panel.Children) {
-        if ($ch -is [System.Windows.Controls.CheckBox]) { $ch.IsChecked = $Value }
-    }
+    foreach ($cb in (Get-PanelCheckBoxes $Panel)) { $cb.IsChecked = $Value }
 }
 
 # Mapa Name -> item do ledger, apenas dos que estao Instalado/JaPresente.
@@ -125,38 +176,53 @@ function Get-InstalledStateMap {
     return $map
 }
 
-# Marca um checkbox como "ja instalado" (texto ao lado + cor verde) pelo mapa.
-function Set-WpfInstalledMark {
-    param($CheckBox, $Map, [string] $Key)
-    if ($Map.ContainsKey($Key)) {
-        $ts  = $Map[$Key].Timestamp
-        $tag = if ($ts) { "[instalado $($ts.Substring(0,10))]" } else { '[instalado]' }
-        $CheckBox.Content = "$($CheckBox.Content)   $tag"
-        $CheckBox.Foreground = [System.Windows.Media.Brushes]::LightGreen
+# Cria uma "linha" de item: [CheckBox] + (se ja feito) [marca "[feito em <data>]"
+# verde e clicavel -> popup com o JSON]. A marca fica FORA do checkbox para o
+# clique nela nao marcar/desmarcar o item. $LedgerKey = Name no ledger.
+function New-WpfItemRow {
+    param([string] $Text, $Tag, $Map, [string] $LedgerKey, $Owner)
+    $row = New-Object System.Windows.Controls.StackPanel
+    $row.Orientation = 'Horizontal'
+
+    $cb = New-Object System.Windows.Controls.CheckBox
+    $cb.Content = $Text
+    $cb.Tag = $Tag
+    $cb.VerticalAlignment = 'Center'
+    [void]$row.Children.Add($cb)
+
+    if ($Map -and $LedgerKey -and $Map.ContainsKey($LedgerKey)) {
+        $it = $Map[$LedgerKey]
+        $ts = if ($it.Timestamp) { [string]$it.Timestamp } else { '' }
+        $mk = New-Object System.Windows.Controls.TextBlock
+        $mk.Text = if ($ts) { "   [feito em $ts]" } else { '   [feito]' }
+        $mk.Foreground = [System.Windows.Media.Brushes]::LightGreen
+        $mk.VerticalAlignment = 'Center'
+        $mk.Cursor = [System.Windows.Input.Cursors]::Hand
+        $mk.ToolTip = 'Clique para ver o registro (JSON) deste item'
+        $mk.Add_MouseLeftButtonUp({ Show-LedgerJsonPopup -Name $LedgerKey -Owner $Owner }.GetNewClosure())
+        [void]$row.Children.Add($mk)
     }
+    return $row
 }
 
 # Features: exclui Web/IIS e .NET (vao na aba IIS). Mantem Virtualizacao, Rede,
 # Mensageria. Mantem a ordem do catalogo, agrupando por categoria.
 function Add-WpfFeatureItems {
-    param($Panel)
+    param($Panel, $Owner)
     $Panel.Children.Clear()
     $map = Get-InstalledStateMap
     $lastCat = ''
     foreach ($c in @(Get-AvailableCapabilities)) {
         if ($c.Category -in @('Web/IIS', '.NET')) { continue }
         if ($c.Category -ne $lastCat) { [void]$Panel.Children.Add((New-WpfHeader $c.Category)); $lastCat = $c.Category }
-        $cb = New-Object System.Windows.Controls.CheckBox
-        $cb.Content = if ($c.Notes) { "$($c.Display)   ($($c.Notes))" } else { $c.Display }
-        $cb.Tag = $c.Id
-        Set-WpfInstalledMark $cb $map $c.Display
-        [void]$Panel.Children.Add($cb)
+        $text = if ($c.Notes) { "$($c.Display)   ($($c.Notes))" } else { $c.Display }
+        [void]$Panel.Children.Add((New-WpfItemRow -Text $text -Tag $c.Id -Map $map -LedgerKey $c.Display -Owner $Owner))
     }
 }
 
 # Softwares: catalogo embutido + de usuario. Filtro 'all' | 'winget' | 'choco'.
 function Add-WpfSoftwareItems {
-    param($Panel, [string] $Filter = 'all')
+    param($Panel, [string] $Filter = 'all', $Owner)
     $Panel.Children.Clear()
     Import-UserSoftwareCatalog | Out-Null
     $map = Get-InstalledStateMap
@@ -167,31 +233,46 @@ function Add-WpfSoftwareItems {
     foreach ($p in $list) {
         if ($p.Category -ne $lastCat) { [void]$Panel.Children.Add((New-WpfHeader $p.Category)); $lastCat = $p.Category }
         $src = @(); if ($p.Choco) { $src += 'choco' }; if ($p.Winget) { $src += 'winget' }
-        $cb = New-Object System.Windows.Controls.CheckBox
-        $cb.Content = "$($p.Name)   ($($src -join '/'))"
-        $cb.Tag = $p.Key
-        Set-WpfInstalledMark $cb $map $p.Name
-        [void]$Panel.Children.Add($cb)
+        $text = "$($p.Name)   ($($src -join '/'))"
+        [void]$Panel.Children.Add((New-WpfItemRow -Text $text -Tag $p.Key -Map $map -LedgerKey $p.Name -Owner $Owner))
     }
 }
 
 # IIS: lista COMPLETA na ordem de $Script:IISFeatures + itens de pos-instalacao
 # (aspnet_state, iisreset) como marcadores especiais.
 function Add-WpfIisItems {
-    param($Panel)
+    param($Panel, $Owner)
     $Panel.Children.Clear()
     $map = Get-InstalledStateMap
     [void]$Panel.Children.Add((New-WpfHeader 'Features do IIS (ordem padrao)'))
     foreach ($f in $Script:IISFeatures) {
-        $cb = New-Object System.Windows.Controls.CheckBox
-        $cb.Content = $f
-        $cb.Tag = $f
-        Set-WpfInstalledMark $cb $map $f
-        [void]$Panel.Children.Add($cb)
+        [void]$Panel.Children.Add((New-WpfItemRow -Text $f -Tag $f -Map $map -LedgerKey $f -Owner $Owner))
     }
     [void]$Panel.Children.Add((New-WpfHeader 'Pos-instalacao'))
-    $a = New-Object System.Windows.Controls.CheckBox; $a.Content = 'aspnet_state = Automatico'; $a.Tag = '__aspnet_state__'; [void]$Panel.Children.Add($a)
-    $i = New-Object System.Windows.Controls.CheckBox; $i.Content = 'iisreset'; $i.Tag = '__iisreset__'; [void]$Panel.Children.Add($i)
+    [void]$Panel.Children.Add((New-WpfItemRow -Text 'aspnet_state = Automatico' -Tag '__aspnet_state__' -Map $map -LedgerKey 'aspnet_state' -Owner $Owner))
+    [void]$Panel.Children.Add((New-WpfItemRow -Text 'iisreset' -Tag '__iisreset__' -Map $map -LedgerKey 'iisreset' -Owner $Owner))
+}
+
+# Sistema: aba unificada (Customizacoes + Configuracao base). Cada item vira uma
+# linha com marca "[feito em ...]" clicavel, igual as demais abas. As Tags batem
+# com o switch do botao "Aplicar selecionados".
+function Add-WpfSystemItems {
+    param($Panel, $Owner)
+    $Panel.Children.Clear()
+    $map = Get-InstalledStateMap
+
+    [void]$Panel.Children.Add((New-WpfHeader 'Customizacoes (Explorer / UI)'))
+    [void]$Panel.Children.Add((New-WpfItemRow -Text 'Ativar Dark Mode (apps e sistema)'                  -Tag 'dark'        -Map $map -LedgerKey 'Dark Mode' -Owner $Owner))
+    [void]$Panel.Children.Add((New-WpfItemRow -Text 'Mostrar extensoes de arquivos'                       -Tag 'ext'         -Map $map -LedgerKey 'Mostrar extensoes' -Owner $Owner))
+    [void]$Panel.Children.Add((New-WpfItemRow -Text 'Mostrar arquivos ocultos'                            -Tag 'hidden'      -Map $map -LedgerKey 'Mostrar ocultos' -Owner $Owner))
+    [void]$Panel.Children.Add((New-WpfItemRow -Text 'Mostrar tambem arquivos protegidos do SO'            -Tag 'superhidden' -Map $map -LedgerKey 'Mostrar ocultos (+protegidos)' -Owner $Owner))
+    [void]$Panel.Children.Add((New-WpfItemRow -Text 'Desativar Print Screen abrindo a Ferramenta de Captura' -Tag 'printscr' -Map $map -LedgerKey 'Print Screen (Snipping off)' -Owner $Owner))
+
+    [void]$Panel.Children.Add((New-WpfHeader 'Configuracao base'))
+    [void]$Panel.Children.Add((New-WpfItemRow -Text 'Desativar IE Enhanced Security Configuration (IE ESC)' -Tag 'ieesc'   -Map $map -LedgerKey 'IE ESC desativado' -Owner $Owner))
+    [void]$Panel.Children.Add((New-WpfItemRow -Text 'Time zone para Brasilia'                             -Tag 'tz'        -Map $map -LedgerKey 'Time zone Brasilia' -Owner $Owner))
+    [void]$Panel.Children.Add((New-WpfItemRow -Text 'Ajustar/sincronizar data e hora (via internet)'      -Tag 'datetime'  -Map $map -LedgerKey 'Data e hora' -Owner $Owner))
+    [void]$Panel.Children.Add((New-WpfItemRow -Text 'Nao iniciar o Server Manager no logon'               -Tag 'srvmgr'    -Map $map -LedgerKey 'Server Manager no logon (off)' -Owner $Owner))
 }
 
 function Set-WpfStatusPanel {
@@ -204,10 +285,10 @@ function Set-WpfStatusPanel {
         $RebootLabel.Text = 'Sem reinicio pendente.'
         $RebootLabel.Foreground = [System.Windows.Media.Brushes]::LightGreen
     }
-    # Cabecalho ao vivo: maquina / OS / IPs atuais.
+    # Cabecalho ao vivo: maquina / tipo (fisica/virtual) / OS / IPs atuais.
     $mi = Get-MachineInfo
     $hMac = New-Object System.Windows.Controls.TextBlock
-    $hMac.Text = "Maquina: $($mi.Machine)    IPs: $((@(Get-HostIPv4) -join ', '))"
+    $hMac.Text = "Maquina: $($mi.Machine)   [$($mi.Kind)]    IPs: $((@(Get-HostIPv4) -join ', '))"
     $hMac.Foreground = [System.Windows.Media.Brushes]::DeepSkyBlue
     $hMac.Margin = [System.Windows.Thickness]::new(0, 8, 0, 0)
     [void]$Panel.Children.Add($hMac)
@@ -241,6 +322,11 @@ function Set-WpfStatusPanel {
                 $mq  = if ($it.Machine -and $it.Machine -ne $mi.Machine) { "   @$($it.Machine)" } else { '' }
                 $tb.Text = "   - $($it.Name)$d$ts$dur$mq"
                 $tb.Margin = [System.Windows.Thickness]::new(12, 1, 0, 1)
+                $tb.Cursor = [System.Windows.Input.Cursors]::Hand
+                $tb.ToolTip = 'Clique para ver o registro (JSON) deste item'
+                $nm = [string]$it.Name
+                $own = [System.Windows.Window]::GetWindow($Panel)
+                $tb.Add_MouseLeftButtonUp({ Show-LedgerJsonPopup -Name $nm -Owner $own }.GetNewClosure())
                 [void]$Panel.Children.Add($tb)
             }
         }
@@ -360,11 +446,17 @@ function Show-InstallerWpf {
 
       <TabItem Header="Features">
         <DockPanel Background="#FF1E1E1E">
-          <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="12,8">
-            <Button x:Name="btnFeatAll" Content="Selecionar tudo" Width="130" Height="28"/>
-            <Button x:Name="btnFeatNone" Content="Limpar" Width="90" Height="28"/>
-            <Button x:Name="btnFeatApply" Content="Aplicar selecionados" Width="180" Height="28" Background="#FF1E7D34" BorderBrush="#FF1E7D34"/>
-            <TextBlock x:Name="lblFeat" Margin="12,0,0,0" VerticalAlignment="Center" Foreground="#FF9CDCFE"/>
+          <StackPanel DockPanel.Dock="Top" Margin="12,8">
+            <StackPanel Orientation="Horizontal">
+              <Button x:Name="btnFeatAll" Content="Selecionar tudo" Width="130" Height="28"/>
+              <Button x:Name="btnFeatNone" Content="Limpar" Width="90" Height="28"/>
+              <Button x:Name="btnFeatApply" Content="Aplicar selecionados" Width="180" Height="28" Background="#FF1E7D34" BorderBrush="#FF1E7D34"/>
+              <TextBlock x:Name="lblFeat" Margin="12,0,0,0" VerticalAlignment="Center" Foreground="#FF9CDCFE"/>
+            </StackPanel>
+            <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+              <Button x:Name="btnSsh" Content="Instalar OpenSSH Server" Width="190" Height="28"/>
+              <Button x:Name="btnWsl" Content="Atualizar WSL (wsl --update)" Width="200" Height="28"/>
+            </StackPanel>
           </StackPanel>
           <ScrollViewer VerticalScrollBarVisibility="Auto" Background="#FF1E1E1E">
             <StackPanel x:Name="spFeatures" Margin="12"/>
@@ -470,26 +562,40 @@ function Show-InstallerWpf {
         </ScrollViewer>
       </TabItem>
 
-      <TabItem Header="Customizacoes">
-        <StackPanel Margin="14">
-          <CheckBox x:Name="chkDark" Content="Ativar Dark Mode (apps e sistema)"/>
-          <CheckBox x:Name="chkExt" Content="Mostrar extensoes de arquivos"/>
-          <CheckBox x:Name="chkHidden" Content="Mostrar arquivos ocultos"/>
-          <CheckBox x:Name="chkSuperHidden" Content="Mostrar tambem arquivos protegidos do SO"/>
-          <Button x:Name="btnCust" Content="Aplicar customizacoes" Width="200" Height="32" HorizontalAlignment="Left" Margin="12,12,0,0" Background="#FF1E7D34" BorderBrush="#FF1E7D34"/>
-          <TextBlock x:Name="lblCust" Margin="12,12,0,0" TextWrapping="Wrap" Foreground="#FF9CDCFE"/>
-        </StackPanel>
+      <TabItem Header="Sistema">
+        <DockPanel Background="#FF1E1E1E">
+          <StackPanel DockPanel.Dock="Top" Margin="12,8">
+            <StackPanel Orientation="Horizontal">
+              <Button x:Name="btnSysAll" Content="Selecionar tudo" Width="130" Height="28"/>
+              <Button x:Name="btnSysNone" Content="Limpar" Width="90" Height="28"/>
+              <Button x:Name="btnSysApply" Content="Aplicar selecionados" Width="180" Height="28" Background="#FF1E7D34" BorderBrush="#FF1E7D34"/>
+              <Button x:Name="btnStartupUser" Content="Abrir Startup (usuario)" Width="170" Height="28"/>
+              <Button x:Name="btnStartupAll" Content="Abrir Startup (todos)" Width="160" Height="28"/>
+            </StackPanel>
+            <TextBlock x:Name="lblSys" Margin="0,6,0,0" TextWrapping="Wrap" Foreground="#FF9CDCFE"/>
+          </StackPanel>
+          <ScrollViewer VerticalScrollBarVisibility="Auto" Background="#FF1E1E1E">
+            <StackPanel x:Name="spSystem" Margin="12"/>
+          </ScrollViewer>
+        </DockPanel>
       </TabItem>
 
-      <TabItem Header="Config base">
-        <StackPanel Margin="14">
-          <CheckBox x:Name="chkIeEsc" Content="Desativar IE Enhanced Security Configuration (IE ESC)"/>
-          <CheckBox x:Name="chkTz" Content="Time zone para Brasilia"/>
-          <CheckBox x:Name="chkNtp" Content="Ajustar/sincronizar data e hora (NTP)"/>
-          <CheckBox x:Name="chkSrvMgr" Content="Nao iniciar o Server Manager no logon"/>
-          <Button x:Name="btnBase" Content="Aplicar config. base" Width="200" Height="32" HorizontalAlignment="Left" Margin="12,12,0,0" Background="#FF1E7D34" BorderBrush="#FF1E7D34"/>
-          <TextBlock x:Name="lblBase" Margin="12,12,0,0" TextWrapping="Wrap" Foreground="#FF9CDCFE"/>
-        </StackPanel>
+      <TabItem Header="Atualizacoes">
+        <DockPanel Background="#FF1E1E1E">
+          <StackPanel DockPanel.Dock="Top" Margin="12,8">
+            <TextBlock TextWrapping="Wrap" Margin="0,0,0,6"
+                       Text="Mostra e aplica atualizacoes pendentes do winget e do Chocolatey - inclusive de apps que NAO foram instalados por esta ferramenta. Tudo fica registrado no log."/>
+            <StackPanel Orientation="Horizontal">
+              <Button x:Name="btnUpdCheck" Content="Ver pendentes" Width="140" Height="28"/>
+              <Button x:Name="btnUpdWinget" Content="Atualizar tudo (winget)" Width="180" Height="28" Background="#FF1E7D34" BorderBrush="#FF1E7D34"/>
+              <Button x:Name="btnUpdChoco" Content="Atualizar tudo (choco)" Width="180" Height="28" Background="#FF1E7D34" BorderBrush="#FF1E7D34"/>
+            </StackPanel>
+            <TextBlock x:Name="lblUpd" Margin="0,6,0,0" TextWrapping="Wrap" Foreground="#FF9CDCFE"/>
+          </StackPanel>
+          <TextBox x:Name="txtUpd" Margin="12" IsReadOnly="True" TextWrapping="NoWrap" FontFamily="Consolas"
+                   VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
+                   Background="#FF252526" Foreground="#FFEEEEEE" BorderBrush="#FF3F3F46"/>
+        </DockPanel>
       </TabItem>
 
     </TabControl>
@@ -523,6 +629,7 @@ function Show-InstallerWpf {
     $lblReboot = $win.FindName('lblReboot'); $spStatus = $win.FindName('spStatus')
     $btnRefresh = $win.FindName('btnRefresh'); $btnClearState = $win.FindName('btnClearState')
     $spFeatures = $win.FindName('spFeatures'); $btnFeatAll = $win.FindName('btnFeatAll'); $btnFeatNone = $win.FindName('btnFeatNone'); $btnFeatApply = $win.FindName('btnFeatApply'); $lblFeat = $win.FindName('lblFeat')
+    $btnSsh = $win.FindName('btnSsh'); $btnWsl = $win.FindName('btnWsl')
     $rbChoco = $win.FindName('rbChoco'); $rbAuto = $win.FindName('rbAuto')
     $rbFiltAll = $win.FindName('rbFiltAll'); $rbFiltWinget = $win.FindName('rbFiltWinget'); $rbFiltChoco = $win.FindName('rbFiltChoco')
     $spSoftware = $win.FindName('spSoftware'); $btnSoftAll = $win.FindName('btnSoftAll'); $btnSoftNone = $win.FindName('btnSoftNone')
@@ -534,23 +641,25 @@ function Show-InstallerWpf {
     $dhScope = $win.FindName('dhScope'); $dhMask = $win.FindName('dhMask'); $dhGw = $win.FindName('dhGw')
     $dhFrom = $win.FindName('dhFrom'); $dhTo = $win.FindName('dhTo'); $dhDns = $win.FindName('dhDns'); $dhLease = $win.FindName('dhLease')
     $btnDhcp = $win.FindName('btnDhcp'); $lblNet = $win.FindName('lblNet')
-    $chkDark = $win.FindName('chkDark'); $chkExt = $win.FindName('chkExt'); $chkHidden = $win.FindName('chkHidden'); $chkSuperHidden = $win.FindName('chkSuperHidden')
-    $btnCust = $win.FindName('btnCust'); $lblCust = $win.FindName('lblCust')
-    $chkIeEsc = $win.FindName('chkIeEsc'); $chkTz = $win.FindName('chkTz'); $chkNtp = $win.FindName('chkNtp'); $chkSrvMgr = $win.FindName('chkSrvMgr')
-    $btnBase = $win.FindName('btnBase'); $lblBase = $win.FindName('lblBase')
+    $spSystem = $win.FindName('spSystem'); $btnSysAll = $win.FindName('btnSysAll'); $btnSysNone = $win.FindName('btnSysNone'); $btnSysApply = $win.FindName('btnSysApply')
+    $btnStartupUser = $win.FindName('btnStartupUser'); $btnStartupAll = $win.FindName('btnStartupAll'); $lblSys = $win.FindName('lblSys')
+    $btnUpdCheck = $win.FindName('btnUpdCheck'); $btnUpdWinget = $win.FindName('btnUpdWinget'); $btnUpdChoco = $win.FindName('btnUpdChoco')
+    $txtUpd = $win.FindName('txtUpd'); $lblUpd = $win.FindName('lblUpd')
 
     $txtLog.Text = $Script:DefaultLogDir
     $ui = @{ Nets = @(); Iface = '' }
 
-    Add-WpfFeatureItems $spFeatures
-    Add-WpfSoftwareItems $spSoftware 'all'
-    Add-WpfIisItems $spIis
+    Add-WpfFeatureItems $spFeatures $win
+    Add-WpfSoftwareItems $spSoftware 'all' $win
+    Add-WpfIisItems $spIis $win
+    Add-WpfSystemItems $spSystem $win
     Set-WpfStatusPanel $spStatus $lblReboot
 
     # Botoes que devem ser desabilitados durante uma operacao.
-    $actionButtons = @($btnFeatApply, $btnFeatAll, $btnFeatNone, $btnSoftApply, $btnSoftAll, $btnSoftNone,
+    $actionButtons = @($btnFeatApply, $btnFeatAll, $btnFeatNone, $btnSsh, $btnWsl, $btnSoftApply, $btnSoftAll, $btnSoftNone,
         $btnChocoUpg, $btnAddSoft, $btnIisApply, $btnIisAll, $btnIisNone, $btnIisFull, $btnAspNet, $btnIisReset,
-        $btnNat, $btnDetect, $btnDhcp, $btnCust, $btnBase)
+        $btnNat, $btnDetect, $btnDhcp, $btnSysApply, $btnSysAll, $btnSysNone, $btnStartupUser, $btnStartupAll,
+        $btnUpdCheck, $btnUpdWinget, $btnUpdChoco)
     $setBusy = { param([bool] $b) foreach ($x in $actionButtons) { if ($x) { $x.IsEnabled = -not $b } } }
     $applyLog = { if ($txtLog.Text.Trim()) { Set-LogDirectory -Path $txtLog.Text.Trim() } }
     $softFilter = { if ($rbFiltWinget.IsChecked) { 'winget' } elseif ($rbFiltChoco.IsChecked) { 'choco' } else { 'all' } }
@@ -571,20 +680,32 @@ function Show-InstallerWpf {
         try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog
             Invoke-CapabilityInstall -Ids $ids; $lblFeat.Text = Get-SummaryText
         } catch { $lblFeat.Text = "Erro: $($_.Exception.Message)" }
-        finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot; Add-WpfFeatureItems $spFeatures }
+        finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot; Add-WpfFeatureItems $spFeatures $win }
+    })
+    $btnSsh.Add_Click({
+        if (-not (Confirm-Wpf 'Instalar o OpenSSH Server (servico sshd em Automatico + firewall na porta 22)?')) { return }
+        try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog; Reset-FeatureSession; Install-OpenSSHServer; Show-FeaturesSummary; $lblFeat.Text = Get-SummaryText }
+        catch { $lblFeat.Text = "Erro: $($_.Exception.Message)" }
+        finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot; Add-WpfFeatureItems $spFeatures $win }
+    })
+    $btnWsl.Add_Click({
+        if (-not (Confirm-Wpf 'Rodar "wsl --update" agora?')) { return }
+        try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog; Reset-FeatureSession; Update-Wsl; Show-FeaturesSummary; $lblFeat.Text = Get-SummaryText }
+        catch { $lblFeat.Text = "Erro: $($_.Exception.Message)" }
+        finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot; Add-WpfFeatureItems $spFeatures $win }
     })
 
     # --- Softwares ---
     $btnSoftAll.Add_Click({ Set-WpfAllChecks $spSoftware $true })
     $btnSoftNone.Add_Click({ Set-WpfAllChecks $spSoftware $false })
-    $rbFiltAll.Add_Checked({ Add-WpfSoftwareItems $spSoftware 'all' })
-    $rbFiltWinget.Add_Checked({ Add-WpfSoftwareItems $spSoftware 'winget' })
-    $rbFiltChoco.Add_Checked({ Add-WpfSoftwareItems $spSoftware 'choco' })
+    $rbFiltAll.Add_Checked({ Add-WpfSoftwareItems $spSoftware 'all' $win })
+    $rbFiltWinget.Add_Checked({ Add-WpfSoftwareItems $spSoftware 'winget' $win })
+    $rbFiltChoco.Add_Checked({ Add-WpfSoftwareItems $spSoftware 'choco' $win })
     $btnAddSoft.Add_Click({
         $r = Show-AddSoftwareDialog -Owner $win
         if ($r) {
             if (Add-UserSoftware -Name $r.Name -Category $r.Category -Winget $r.Winget -Choco $r.Choco -Notes $r.Notes) {
-                Add-WpfSoftwareItems $spSoftware (& $softFilter)
+                Add-WpfSoftwareItems $spSoftware (& $softFilter) $win
                 $lblSoft.Text = "Adicionado: $($r.Name). Marque e clique 'Aplicar selecionados'."
             } else { $lblSoft.Text = 'Falha ao adicionar (ver log).' }
         }
@@ -609,7 +730,7 @@ function Show-InstallerWpf {
             }
             Show-FeaturesSummary; $lblSoft.Text = Get-SummaryText
         } catch { $lblSoft.Text = "Erro: $($_.Exception.Message)" }
-        finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot; Add-WpfSoftwareItems $spSoftware (& $softFilter) }
+        finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot; Add-WpfSoftwareItems $spSoftware (& $softFilter) $win }
     })
 
     # --- IIS ---
@@ -630,13 +751,13 @@ function Show-InstallerWpf {
             if ($doReset)  { Invoke-IISReset }
             Show-FeaturesSummary; $lblIis.Text = Get-SummaryText
         } catch { $lblIis.Text = "Erro: $($_.Exception.Message)" }
-        finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot; Add-WpfIisItems $spIis }
+        finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot; Add-WpfIisItems $spIis $win }
     })
     $btnIisFull.Add_Click({
         if (-not (Confirm-Wpf "Instalar IIS COMPLETO ($($Script:IISFeatures.Count) features) + aspnet_state + iisreset? Pode demorar.")) { return }
         try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog; Reset-FeatureSession; Install-IISFull; Show-FeaturesSummary; $lblIis.Text = Get-SummaryText }
         catch { $lblIis.Text = "Erro: $($_.Exception.Message)" }
-        finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot; Add-WpfIisItems $spIis }
+        finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot; Add-WpfIisItems $spIis $win }
     })
     $btnAspNet.Add_Click({
         if (-not (Confirm-Wpf 'Definir o servico aspnet_state como Automatico?')) { return }
@@ -708,34 +829,57 @@ function Show-InstallerWpf {
         finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot }
     })
 
-    # --- Customizacoes ---
-    $btnCust.Add_Click({
-        if (-not (Confirm-Wpf 'Aplicar as customizacoes marcadas?')) { return }
+    # --- Sistema (Customizacoes + Config base unificadas) ---
+    $btnSysAll.Add_Click({ Set-WpfAllChecks $spSystem $true })
+    $btnSysNone.Add_Click({ Set-WpfAllChecks $spSystem $false })
+    $btnStartupUser.Add_Click({ Open-StartupFolders })
+    $btnStartupAll.Add_Click({ Open-StartupFolders -AllUsers })
+    $btnSysApply.Add_Click({
+        $tags = @(Get-WpfCheckedTags $spSystem)
+        if ($tags.Count -eq 0) { $lblSys.Text = 'Nada selecionado.'; return }
+        if (-not (Confirm-Wpf "Aplicar os $($tags.Count) item(ns) marcado(s)?")) { return }
         try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog
             Reset-FeatureSession
-            $changed = $false
-            if ($chkDark.IsChecked)   { $c = Enable-DarkMode;     Add-FeatureResult -Name 'Dark Mode' -Status $(if ($c) {'Instalado'} else {'JaPresente'}); $changed = $changed -or $c }
-            if ($chkExt.IsChecked)    { $c = Show-FileExtensions; Add-FeatureResult -Name 'Mostrar extensoes' -Status $(if ($c) {'Instalado'} else {'JaPresente'}); $changed = $changed -or $c }
-            if ($chkSuperHidden.IsChecked) { $c = Show-HiddenFiles -IncludeProtectedOsFiles; Add-FeatureResult -Name 'Mostrar ocultos (+protegidos)' -Status $(if ($c) {'Instalado'} else {'JaPresente'}); $changed = $changed -or $c }
-            elseif ($chkHidden.IsChecked) { $c = Show-HiddenFiles; Add-FeatureResult -Name 'Mostrar ocultos' -Status $(if ($c) {'Instalado'} else {'JaPresente'}); $changed = $changed -or $c }
-            if ($changed) { Restart-Explorer }
-            $lblCust.Text = if ($Script:FeatureResults.Count) { Get-SummaryText } else { 'Nada selecionado.' }
-        } catch { $lblCust.Text = "Erro: $($_.Exception.Message)" }
-        finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot }
+            $restartExplorer = $false
+            foreach ($t in $tags) {
+                switch ($t) {
+                    'dark'        { $c = Enable-DarkMode;        Add-FeatureResult -Name 'Dark Mode' -Status $(if ($c) {'Instalado'} else {'JaPresente'}); $restartExplorer = $restartExplorer -or $c }
+                    'ext'         { $c = Show-FileExtensions;    Add-FeatureResult -Name 'Mostrar extensoes' -Status $(if ($c) {'Instalado'} else {'JaPresente'}); $restartExplorer = $restartExplorer -or $c }
+                    'hidden'      { $c = Show-HiddenFiles;       Add-FeatureResult -Name 'Mostrar ocultos' -Status $(if ($c) {'Instalado'} else {'JaPresente'}); $restartExplorer = $restartExplorer -or $c }
+                    'superhidden' { $c = Show-HiddenFiles -IncludeProtectedOsFiles; Add-FeatureResult -Name 'Mostrar ocultos (+protegidos)' -Status $(if ($c) {'Instalado'} else {'JaPresente'}); $restartExplorer = $restartExplorer -or $c }
+                    'printscr'    { $c = Disable-PrintScreenSnipping; Add-FeatureResult -Name 'Print Screen (Snipping off)' -Status $(if ($c) {'Instalado'} else {'JaPresente'}) }
+                    'ieesc'       { try { Disable-IEEsc;                 Add-FeatureResult -Name 'IE ESC desativado' -Status 'Instalado' } catch { Add-FeatureResult -Name 'IE ESC desativado' -Status 'Falha' -Detail $_.Exception.Message } }
+                    'tz'          { try { Set-TimeZoneBrasilia;          Add-FeatureResult -Name 'Time zone Brasilia' -Status 'Instalado' } catch { Add-FeatureResult -Name 'Time zone Brasilia' -Status 'Falha' -Detail $_.Exception.Message } }
+                    'datetime'    { try { if (Sync-DateTime) { Add-FeatureResult -Name 'Data e hora' -Status 'Instalado' } else { Add-FeatureResult -Name 'Data e hora' -Status 'Falha' -Detail 'Nao obteve a hora via HTTP' } } catch { Add-FeatureResult -Name 'Data e hora' -Status 'Falha' -Detail $_.Exception.Message } }
+                    'srvmgr'      { try { Disable-ServerManagerAutoStart; Add-FeatureResult -Name 'Server Manager no logon (off)' -Status 'Instalado' } catch { Add-FeatureResult -Name 'Server Manager no logon (off)' -Status 'Falha' -Detail $_.Exception.Message } }
+                }
+            }
+            if ($restartExplorer) { Restart-Explorer }
+            $lblSys.Text = if ($Script:FeatureResults.Count) { Get-SummaryText } else { 'Nada aplicado.' }
+        } catch { $lblSys.Text = "Erro: $($_.Exception.Message)" }
+        finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot; Add-WpfSystemItems $spSystem $win }
     })
 
-    # --- Config base ---
-    $btnBase.Add_Click({
-        if (-not (Confirm-Wpf 'Aplicar a configuracao base marcada?')) { return }
+    # --- Atualizacoes (winget + choco) ---
+    $btnUpdCheck.Add_Click({
         try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog
-            Reset-FeatureSession
-            if ($chkIeEsc.IsChecked)  { try { Disable-IEEsc;                 Add-FeatureResult -Name 'IE ESC desativado' -Status 'Instalado' } catch { Add-FeatureResult -Name 'IE ESC' -Status 'Falha' -Detail $_.Exception.Message } }
-            if ($chkTz.IsChecked)     { try { Set-TimeZoneBrasilia;          Add-FeatureResult -Name 'Time zone Brasilia' -Status 'Instalado' } catch { Add-FeatureResult -Name 'Time zone' -Status 'Falha' -Detail $_.Exception.Message } }
-            if ($chkNtp.IsChecked)    { try { Sync-DateTime;                 Add-FeatureResult -Name 'Sync NTP' -Status 'Instalado' } catch { Add-FeatureResult -Name 'Sync NTP' -Status 'Falha' -Detail $_.Exception.Message } }
-            if ($chkSrvMgr.IsChecked) { try { Disable-ServerManagerAutoStart; Add-FeatureResult -Name 'Server Manager no logon (off)' -Status 'Instalado' } catch { Add-FeatureResult -Name 'Server Manager logon' -Status 'Falha' -Detail $_.Exception.Message } }
-            $lblBase.Text = if ($Script:FeatureResults.Count) { Get-SummaryText } else { 'Nada selecionado.' }
-        } catch { $lblBase.Text = "Erro: $($_.Exception.Message)" }
-        finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot }
+            $w1 = Get-WingetUpgrades; $c1 = Get-ChocoOutdated
+            $txtUpd.Text = "===== WINGET (winget upgrade) =====`r`n$w1`r`n`r`n===== CHOCOLATEY (choco outdated) =====`r`n$c1"
+            $lblUpd.Text = 'Lista de pendentes atualizada (ver tambem o log).'
+        } catch { $lblUpd.Text = "Erro: $($_.Exception.Message)" }
+        finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false }
+    })
+    $btnUpdWinget.Add_Click({
+        if (-not (Confirm-Wpf 'Atualizar TUDO que o winget tem pendente? Pode demorar.')) { return }
+        try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog; Update-AllWinget; $lblUpd.Text = 'winget upgrade --all executado (ver log/console).' }
+        catch { $lblUpd.Text = "Erro: $($_.Exception.Message)" }
+        finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false }
+    })
+    $btnUpdChoco.Add_Click({
+        if (-not (Confirm-Wpf 'Atualizar TUDO que o choco tem pendente? Pode demorar.')) { return }
+        try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog; Update-AllChoco; $lblUpd.Text = 'choco upgrade all executado (ver log/console).' }
+        catch { $lblUpd.Text = "Erro: $($_.Exception.Message)" }
+        finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false }
     })
 
     $null = $win.ShowDialog()
