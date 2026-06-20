@@ -28,6 +28,11 @@ $Script:StateFile = Join-Path (Split-Path $Script:LogFile -Parent) 'installer-st
 # DispatcherTimer na UI drena para o painel. Mesma referencia nos dois runspaces.
 $Script:LiveLog = $null
 
+# No worker (runspace sem console util) o Write-Host pode TRAVAR ou lancar e
+# segurar a thread inteira. Quando $Script:NoConsole = $true (o worker liga isso),
+# Write-Log pula o console e escreve so no arquivo + sink LiveLog (painel "Log ao vivo").
+$Script:NoConsole = $false
+
 # Define a pasta onde os logs serao gravados (campo "Pasta de log" da tela).
 # Gera um arquivo por execucao com timestamp passado pelo chamador, ou o
 # install.log padrao quando -FileName nao e informado.
@@ -73,7 +78,9 @@ function Write-Log {
         'STEP' { '==> ' }
         default { '  -    ' }
     }
-    Write-Host "$prefix$Message" -ForegroundColor $color
+    if (-not $Script:NoConsole) {
+        try { Write-Host "$prefix$Message" -ForegroundColor $color } catch { }
+    }
 
     if ($null -ne $Script:LiveLog) { try { [void]$Script:LiveLog.Add($line) } catch { } }
 }

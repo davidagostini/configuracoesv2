@@ -71,7 +71,8 @@ Módulos (em `modules/`):
 - **`Software.ps1`** — catálogo declarativo `$Script:SoftwareCatalog` (app -> id choco + id winget +
   flags) **+ catálogo de usuário editável** (`software-extra.json`): `Import-UserSoftwareCatalog`
   (mescla) e `Add-UserSoftware` (grava) — adicionar apps sem mexer no código. Instala via choco **ou**
-  winget; `Install-Chocolatey` faz bootstrap.
+  winget; `Install-Chocolatey` faz bootstrap. **Padrão = Chocolatey** (fallback winget se o app não
+  tiver pacote choco); o usuário pode trocar para winget/auto na aba.
 - **`Gui.ps1`** — fallback de console e o **menu principal**: `Start-MainMenu` / `Show-MainMenu`,
   `Show-InstallerGui` (WinForms), `Show-InstallerConsole`, `Start-InstallerUi`, `Get-SummaryText`.
 - **`GuiWpf.ps1`** — **UI primária**: janela **WPF** estilo app, tema escuro, **ícone próprio**
@@ -109,11 +110,11 @@ Módulos (em `modules/`):
 - **Idempotência.** Operações checam estado antes de agir (`Set-RegistryValue`, `Get-WindowsFeature`,
   `Get-WindowsOptionalFeature` etc.) e não repetem trabalho.
 - **Dispatch por capacidade, não por nome de SO.** Para escolher a API de feature, cheque a
-  presença do módulo ServerManager (`(Get-OSRole).HasServerManager`), não o nome da edição. Hoje só
-  Containers diverge (Install-WindowsFeature no Server vs DISM no Client). O **Hyper-V usa DISM**
-  (`Microsoft-Hyper-V-All`) **nos dois SOs** de propósito: no Server o `Install-WindowsFeature` do
-  Hyper-V trava no Server Manager (*"plug-in taking more time to load"*). As demais usam os mesmos
-  ids DISM nos dois. Ver `docs/DESIGN-irm-gui.md`.
+  presença do módulo ServerManager (`(Get-OSRole).HasServerManager`), não o nome da edição. Hyper-V e
+  Containers divergem entre client e server: no Server, Hyper-V usa `Install-WindowsFeature -Name
+  Hyper-V -IncludeManagementTools -Restart` (**reinicia sozinho** ao concluir — decisão do usuário);
+  no client, DISM `Microsoft-Hyper-V-All`. As demais usam os mesmos ids DISM nos dois.
+  Ver `docs/DESIGN-irm-gui.md`.
 
 ## Distribuição (implementada — v1.0.0 — ver docs/)
 

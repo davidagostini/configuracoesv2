@@ -500,6 +500,7 @@ function Start-InstallWorker {
             Invoke-Expression $WINCFG_SRC
             # (2) religa as estruturas compartilhadas ao $Script: do worker.
             $Script:LiveLog = $WINCFG_LIVE
+            $Script:NoConsole = $true   # worker NAO escreve no console (evita travar/lancar)
             if ($WINCFG_LOGDIR) { try { Set-LogDirectory -Path $WINCFG_LOGDIR } catch { } }
             Import-UserSoftwareCatalog | Out-Null
             # (3) laco serial: 1 job por vez.
@@ -511,13 +512,18 @@ function Start-InstallWorker {
                 if ($job) {
                     try {
                         $WINCFG_SIGNAL.Enqueue(@{ Type = 'JobStart'; Label = $job.Label; Tab = $job.Tab })
+                        try { [void]$WINCFG_LIVE.Add("==> Iniciando: $($job.Label)") } catch { }
                         if ($job.Data -and $job.Data.LogDir) { try { Set-LogDirectory -Path $job.Data.LogDir } catch { } }
                         Invoke-WorkerJob -Job $job
                     } catch {
                         Write-Log "Falha no job '$($job.Label)': $($_.Exception.Message)" -Level ERRO
                     } finally {
+                        try { [void]$WINCFG_LIVE.Add("<== Concluido: $($job.Label)") } catch { }
+                        # Oferece reinicio se a maquina ficou com reinicio pendente (cobre
+                        # tanto features DISM 'PrecisaReinicio' quanto WSL/outros que setam
+                        # a flag sem registrar PrecisaReinicio) - so quando a fila esvaziar.
                         $rb = $false
-                        try { if (@($Script:FeatureResults | Where-Object { $_.Status -eq 'PrecisaReinicio' }).Count -gt 0) { $rb = $true } } catch { }
+                        try { $rb = [bool](Test-PendingReboot) } catch { }
                         $WINCFG_SIGNAL.Enqueue(@{ Type = 'JobDone'; Label = $job.Label; Tab = $job.Tab; Reboot = $rb })
                     }
                 } else {
@@ -665,8 +671,8 @@ function Show-InstallerWpf {
           <StackPanel DockPanel.Dock="Top" Margin="12,8">
             <StackPanel Orientation="Horizontal">
               <Label Content="Gerenciador:" VerticalAlignment="Center"/>
-              <RadioButton x:Name="rbWinget" Content="winget" Foreground="#FFDDDDDD" IsChecked="True" Margin="8,0" VerticalAlignment="Center" GroupName="mgr"/>
-              <RadioButton x:Name="rbChoco" Content="Chocolatey" Foreground="#FFDDDDDD" Margin="8,0" VerticalAlignment="Center" GroupName="mgr"/>
+              <RadioButton x:Name="rbWinget" Content="winget" Foreground="#FFDDDDDD" Margin="8,0" VerticalAlignment="Center" GroupName="mgr"/>
+              <RadioButton x:Name="rbChoco" Content="Chocolatey" Foreground="#FFDDDDDD" IsChecked="True" Margin="8,0" VerticalAlignment="Center" GroupName="mgr"/>
               <RadioButton x:Name="rbAuto" Content="auto" Foreground="#FFDDDDDD" Margin="8,0" VerticalAlignment="Center" GroupName="mgr"/>
               <Label Content="   Mostrar:" VerticalAlignment="Center"/>
               <RadioButton x:Name="rbFiltAll" Content="todos" Foreground="#FFDDDDDD" IsChecked="True" Margin="8,0" VerticalAlignment="Center" GroupName="filt"/>
@@ -955,6 +961,17 @@ function Show-InstallerWpf {
                     $Script:CurrentJobLabel = $null
                     if ($s.Reboot) { $Script:RebootRequested = $true }
                     & $repaintTab $s.Tab
+                    # Confirma na propria aba que o job terminou (sem isso o rotulo
+                    # ficava parado em "Enfileirado..." e parecia que nada acontecia).
+                    $doneMsg = "Concluido: $($s.Label). Veja 'Log ao vivo' / aba Status."
+                    switch ($s.Tab) {
+                        'Features'     { $lblFeat.Text = $doneMsg }
+                        'Softwares'    { $lblSoft.Text = $doneMsg }
+                        'IIS'          { $lblIis.Text  = $doneMsg }
+                        'Sistema'      { $lblSys.Text  = $doneMsg }
+                        'Rede'         { $lblNet.Text  = $doneMsg }
+                        'Atualizacoes' { $lblUpd.Text  = $doneMsg }
+                    }
                 }
             }
             # (c) indicador de fila
@@ -1116,7 +1133,7 @@ function Show-InstallerWpf {
     $btnNat.Add_Click({
         if (-not (Confirm-Wpf "Criar/atualizar o NAT Switch '$($natName.Text.Trim())' ($($natSubnet.Text.Trim()))?")) { return }
         if ($Script:UseWorker) {
-            & $enqueue 'nat' @{ SwitchName = $natName.Text.Trim(); Subnet = $natSubnet.Text.Trim(); GatewayIP = $natGw.Text.Trim(); NatName = $natNetName.Text.Trim() } '' "NAT Switch '$($natName.Text.Trim())'"
+            & $enqueue 'nat' @{ SwitchName = $natName.Text.Trim(); Subnet = $natSubnet.Text.Trim(); GatewayIP = $natGw.Text.Trim(); NatName = $natNetName.Text.Trim() } 'Rede' "NAT Switch '$($natName.Text.Trim())'"
             $lblNet.Text = "Enfileirado (fila: $($jobQueue.Count)). Veja 'Log ao vivo'."
         } else {
             try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog
@@ -1169,7 +1186,7 @@ function Show-InstallerWpf {
         $lease = 7300; $tmp = 0
         if ([int]::TryParse($dhLease.Text.Trim(), [ref]$tmp) -and $tmp -gt 0) { $lease = $tmp }
         if ($Script:UseWorker) {
-            & $enqueue 'dhcp' @{ ScopeId = $dhScope.Text.Trim(); Mask = $dhMask.Text.Trim(); RangeFrom = $dhFrom.Text.Trim(); RangeTo = $dhTo.Text.Trim(); Gateway = $dhGw.Text.Trim(); Dns = $dhDns.Text.Trim(); Iface = $iface; LeaseDays = $lease } '' "DHCP NAT ($($dhScope.Text.Trim()))"
+            & $enqueue 'dhcp' @{ ScopeId = $dhScope.Text.Trim(); Mask = $dhMask.Text.Trim(); RangeFrom = $dhFrom.Text.Trim(); RangeTo = $dhTo.Text.Trim(); Gateway = $dhGw.Text.Trim(); Dns = $dhDns.Text.Trim(); Iface = $iface; LeaseDays = $lease } 'Rede' "DHCP NAT ($($dhScope.Text.Trim()))"
             $lblNet.Text = "Enfileirado (fila: $($jobQueue.Count)). Veja 'Log ao vivo'."
         } else {
             try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog
@@ -1232,7 +1249,7 @@ function Show-InstallerWpf {
     $btnUpdWinget.Add_Click({
         if (-not (Confirm-Wpf 'Atualizar TUDO que o winget tem pendente? Pode demorar.')) { return }
         if ($Script:UseWorker) {
-            & $enqueue 'updwinget' @{} '' 'winget upgrade --all'
+            & $enqueue 'updwinget' @{} 'Atualizacoes' 'winget upgrade --all'
             $lblUpd.Text = "Enfileirado (fila: $($jobQueue.Count)). Veja 'Log ao vivo'."
         } else {
             try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog; Update-AllWinget; $lblUpd.Text = 'winget upgrade --all executado (ver log/console).' }
@@ -1243,7 +1260,7 @@ function Show-InstallerWpf {
     $btnUpdChoco.Add_Click({
         if (-not (Confirm-Wpf 'Atualizar TUDO que o choco tem pendente? Pode demorar.')) { return }
         if ($Script:UseWorker) {
-            & $enqueue 'updchoco' @{} '' 'choco upgrade all'
+            & $enqueue 'updchoco' @{} 'Atualizacoes' 'choco upgrade all'
             $lblUpd.Text = "Enfileirado (fila: $($jobQueue.Count)). Veja 'Log ao vivo'."
         } else {
             try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog; Update-AllChoco; $lblUpd.Text = 'choco upgrade all executado (ver log/console).' }

@@ -49,10 +49,10 @@
   unificadas) com marca **"[feito em <data>]" clicavel -> popup do JSON** do item (em todas as abas);
   aba **Atualizacoes** (winget upgrade / choco outdated + atualizar tudo, inclui apps externos);
   **OpenSSH Server** (sshd + firewall 22), **`wsl --update`**, **PowerShell 7** no catalogo,
-  desativar **Print Screen** do Snipping e abrir as pastas **Startup**. **Hyper-V por DISM** nos dois
-  SOs (`Microsoft-Hyper-V-All`) — no Server o `Install-WindowsFeature` trava no Server Manager. Ao
-  esvaziar a fila, se algum item pediu reinicio, a GUI **avisa e reinicia** com contagem cancelavel
-  (`Invoke-RebootOffer`).
+  desativar **Print Screen** do Snipping e abrir as pastas **Startup**. **Hyper-V OS-aware**: Win11
+  via DISM (`Microsoft-Hyper-V-All`); Server via `Install-WindowsFeature -IncludeManagementTools
+  -Restart` (reinicia sozinho). Gerenciador de software **padrao = Chocolatey** (fallback winget).
+  Ao esvaziar a fila, se ficou reinicio pendente, a GUI **avisa e reinicia** (`Invoke-RebootOffer`).
 
 ## Arquivos de runtime (NAO versionados; ficam na maquina alvo)
 

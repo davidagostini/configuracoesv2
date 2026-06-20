@@ -33,6 +33,11 @@ $Script:StateFile = Join-Path (Split-Path $Script:LogFile -Parent) 'installer-st
 # DispatcherTimer na UI drena para o painel. Mesma referencia nos dois runspaces.
 $Script:LiveLog = $null
 
+# No worker (runspace sem console util) o Write-Host pode TRAVAR ou lancar e
+# segurar a thread inteira. Quando $Script:NoConsole = $true (o worker liga isso),
+# Write-Log pula o console e escreve so no arquivo + sink LiveLog (painel "Log ao vivo").
+$Script:NoConsole = $false
+
 # Define a pasta onde os logs serao gravados (campo "Pasta de log" da tela).
 # Gera um arquivo por execucao com timestamp passado pelo chamador, ou o
 # install.log padrao quando -FileName nao e informado.
@@ -78,7 +83,9 @@ function Write-Log {
         'STEP' { '==> ' }
         default { '  -    ' }
     }
-    Write-Host "$prefix$Message" -ForegroundColor $color
+    if (-not $Script:NoConsole) {
+        try { Write-Host "$prefix$Message" -ForegroundColor $color } catch { }
+    }
 
     if ($null -ne $Script:LiveLog) { try { [void]$Script:LiveLog.Add($line) } catch { } }
 }
@@ -479,7 +486,7 @@ function New-Capability {
 }
 
 $Script:CapabilityCatalog = @(
-    (New-Capability 'HyperV'        'Hyper-V'                         'Virtualizacao' 'Both'       @('Microsoft-Hyper-V-All') '' -Notes 'Via DISM; requer reinicio')
+    (New-Capability 'HyperV'        'Hyper-V'                         'Virtualizacao' 'Both'       @() '' -Notes 'Requer reinicio (auto no Server)' -InstallFn 'Install-HyperVRole')
     (New-Capability 'Containers'    'Containers'                     'Virtualizacao' 'Both'       @('Containers') 'Containers')
     (New-Capability 'Sandbox'       'Windows Sandbox'                'Virtualizacao' 'ClientOnly' @('Containers-DisposableClientVM'))
     (New-Capability 'WSL'           'WSL'                            'Virtualizacao' 'Both'       @() '' -Notes 'wsl --update' -InstallFn 'Update-Wsl')
@@ -700,17 +707,48 @@ function Invoke-AllCustomizations {
 # ============================================================================
 
 # --- Hyper-V (Role) - REQUER REINICIO --------------------------------------
-# Instala via DISM (Enable-WindowsOptionalFeature 'Microsoft-Hyper-V-All') TANTO
-# no Windows 11 quanto no Server. No Server EVITAMOS Install-WindowsFeature de
-# proposito: em alguns hosts ele trava no "Collecting data" repetindo
-# "The plug-in for Hyper-V is taking more time to load than expected" e nunca
-# conclui. O DISM nao passa pelo Server Manager (sem plug-in p/ carregar) e o
-# guarda-chuva 'Microsoft-Hyper-V-All -All' ja inclui o modulo PowerShell e o
-# Hyper-V Manager. Enable-OptionalFeatureSafe trata ja-instalado, defere em
-# reinicio pendente, usa -NoRestart e registra PrecisaReinicio.
+# OS-aware (definido pelo usuario):
+#   - Windows 11 (client): Enable-WindowsOptionalFeature -FeatureName Microsoft-Hyper-V-All
+#   - Windows Server:       Install-WindowsFeature -Name Hyper-V -IncludeManagementTools -Restart
+#                           (o servidor REINICIA automaticamente ao concluir).
 function Install-HyperVRole {
-    Write-Log "Verificando/instalando a role Hyper-V (via DISM)..." -Level STEP
-    Enable-OptionalFeatureSafe -FeatureName 'Microsoft-Hyper-V-All' -DisplayName 'Hyper-V' -All
+    $name = 'Hyper-V'
+    Write-Log "Verificando a role Hyper-V..." -Level STEP
+
+    # Windows client (Win11): caminho DISM. Install-WindowsFeature nao existe aqui.
+    if (-not (Get-OSRole).HasServerManager) {
+        Write-Log "SO client detectado - Enable-WindowsOptionalFeature (Microsoft-Hyper-V-All)." -Level INFO
+        Enable-OptionalFeatureSafe -FeatureName 'Microsoft-Hyper-V-All' -DisplayName 'Hyper-V' -All
+        return
+    }
+
+    # Windows Server
+    $state = Get-WindowsFeature -Name Hyper-V -ErrorAction SilentlyContinue
+    if ($state -and $state.Installed) {
+        Write-Log "Hyper-V ja esta instalado." -Level OK
+        Add-FeatureResult -Name $name -Status 'JaPresente'
+        return
+    }
+    if (-not (Test-CanInstallOrDefer -Name $name)) { return }
+
+    Write-Log "Instalando Hyper-V (Install-WindowsFeature -IncludeManagementTools -Restart)..." -Level STEP
+    Write-Log "ATENCAO: o servidor sera REINICIADO automaticamente ao concluir a instalacao." -Level WARN
+    Start-FeatureTimer -Name $name
+    $result = Install-WindowsFeature -Name Hyper-V -IncludeManagementTools -Restart
+
+    # O codigo abaixo so roda se NAO reiniciar (ex.: ja-instalado / sem restart necessario).
+    if ($result.Success) {
+        if ($result.RestartNeeded -ne 'No') {
+            Write-Log "Hyper-V instalado - REINICIO em andamento." -Level WARN
+            Add-FeatureResult -Name $name -Status 'PrecisaReinicio' -Detail 'Reiniciando para concluir o Hyper-V'
+        } else {
+            Write-Log "Hyper-V instalado." -Level OK
+            Add-FeatureResult -Name $name -Status 'Instalado'
+        }
+    } else {
+        Write-Log "Falha ao instalar o Hyper-V. ExitCode: $($result.ExitCode)" -Level ERRO
+        Add-FeatureResult -Name $name -Status 'Falha' -Detail "ExitCode $($result.ExitCode)"
+    }
 }
 
 # --- Telnet Client ----------------------------------------------------------
@@ -1830,9 +1868,9 @@ function Invoke-SoftwareMenu {
     Write-Host ""
     Write-Host "  --- Softwares / Runtimes ---" -ForegroundColor Cyan
     Write-Host "  Gerenciador de instalacao:"
-    Write-Host "    1) winget   2) Chocolatey   3) auto (winget, fallback choco)"
-    $mraw = Read-Host "Escolha [1/2/3]"
-    $preferred = switch ($mraw) { '2' {'choco'} '3' {'auto'} default {'winget'} }
+    Write-Host "    1) Chocolatey (padrao)   2) winget   3) auto"
+    $mraw = Read-Host "Escolha [1/2/3] (ENTER = Chocolatey)"
+    $preferred = switch ($mraw) { '2' {'winget'} '3' {'auto'} default {'choco'} }
     Write-Log "Gerenciador selecionado: $preferred" -Level INFO
 
     if ($preferred -eq 'choco' -or $preferred -eq 'auto') {
@@ -2645,6 +2683,7 @@ function Start-InstallWorker {
             Invoke-Expression $WINCFG_SRC
             # (2) religa as estruturas compartilhadas ao $Script: do worker.
             $Script:LiveLog = $WINCFG_LIVE
+            $Script:NoConsole = $true   # worker NAO escreve no console (evita travar/lancar)
             if ($WINCFG_LOGDIR) { try { Set-LogDirectory -Path $WINCFG_LOGDIR } catch { } }
             Import-UserSoftwareCatalog | Out-Null
             # (3) laco serial: 1 job por vez.
@@ -2656,13 +2695,18 @@ function Start-InstallWorker {
                 if ($job) {
                     try {
                         $WINCFG_SIGNAL.Enqueue(@{ Type = 'JobStart'; Label = $job.Label; Tab = $job.Tab })
+                        try { [void]$WINCFG_LIVE.Add("==> Iniciando: $($job.Label)") } catch { }
                         if ($job.Data -and $job.Data.LogDir) { try { Set-LogDirectory -Path $job.Data.LogDir } catch { } }
                         Invoke-WorkerJob -Job $job
                     } catch {
                         Write-Log "Falha no job '$($job.Label)': $($_.Exception.Message)" -Level ERRO
                     } finally {
+                        try { [void]$WINCFG_LIVE.Add("<== Concluido: $($job.Label)") } catch { }
+                        # Oferece reinicio se a maquina ficou com reinicio pendente (cobre
+                        # tanto features DISM 'PrecisaReinicio' quanto WSL/outros que setam
+                        # a flag sem registrar PrecisaReinicio) - so quando a fila esvaziar.
                         $rb = $false
-                        try { if (@($Script:FeatureResults | Where-Object { $_.Status -eq 'PrecisaReinicio' }).Count -gt 0) { $rb = $true } } catch { }
+                        try { $rb = [bool](Test-PendingReboot) } catch { }
                         $WINCFG_SIGNAL.Enqueue(@{ Type = 'JobDone'; Label = $job.Label; Tab = $job.Tab; Reboot = $rb })
                     }
                 } else {
@@ -2810,8 +2854,8 @@ function Show-InstallerWpf {
           <StackPanel DockPanel.Dock="Top" Margin="12,8">
             <StackPanel Orientation="Horizontal">
               <Label Content="Gerenciador:" VerticalAlignment="Center"/>
-              <RadioButton x:Name="rbWinget" Content="winget" Foreground="#FFDDDDDD" IsChecked="True" Margin="8,0" VerticalAlignment="Center" GroupName="mgr"/>
-              <RadioButton x:Name="rbChoco" Content="Chocolatey" Foreground="#FFDDDDDD" Margin="8,0" VerticalAlignment="Center" GroupName="mgr"/>
+              <RadioButton x:Name="rbWinget" Content="winget" Foreground="#FFDDDDDD" Margin="8,0" VerticalAlignment="Center" GroupName="mgr"/>
+              <RadioButton x:Name="rbChoco" Content="Chocolatey" Foreground="#FFDDDDDD" IsChecked="True" Margin="8,0" VerticalAlignment="Center" GroupName="mgr"/>
               <RadioButton x:Name="rbAuto" Content="auto" Foreground="#FFDDDDDD" Margin="8,0" VerticalAlignment="Center" GroupName="mgr"/>
               <Label Content="   Mostrar:" VerticalAlignment="Center"/>
               <RadioButton x:Name="rbFiltAll" Content="todos" Foreground="#FFDDDDDD" IsChecked="True" Margin="8,0" VerticalAlignment="Center" GroupName="filt"/>
@@ -3100,6 +3144,17 @@ function Show-InstallerWpf {
                     $Script:CurrentJobLabel = $null
                     if ($s.Reboot) { $Script:RebootRequested = $true }
                     & $repaintTab $s.Tab
+                    # Confirma na propria aba que o job terminou (sem isso o rotulo
+                    # ficava parado em "Enfileirado..." e parecia que nada acontecia).
+                    $doneMsg = "Concluido: $($s.Label). Veja 'Log ao vivo' / aba Status."
+                    switch ($s.Tab) {
+                        'Features'     { $lblFeat.Text = $doneMsg }
+                        'Softwares'    { $lblSoft.Text = $doneMsg }
+                        'IIS'          { $lblIis.Text  = $doneMsg }
+                        'Sistema'      { $lblSys.Text  = $doneMsg }
+                        'Rede'         { $lblNet.Text  = $doneMsg }
+                        'Atualizacoes' { $lblUpd.Text  = $doneMsg }
+                    }
                 }
             }
             # (c) indicador de fila
@@ -3261,7 +3316,7 @@ function Show-InstallerWpf {
     $btnNat.Add_Click({
         if (-not (Confirm-Wpf "Criar/atualizar o NAT Switch '$($natName.Text.Trim())' ($($natSubnet.Text.Trim()))?")) { return }
         if ($Script:UseWorker) {
-            & $enqueue 'nat' @{ SwitchName = $natName.Text.Trim(); Subnet = $natSubnet.Text.Trim(); GatewayIP = $natGw.Text.Trim(); NatName = $natNetName.Text.Trim() } '' "NAT Switch '$($natName.Text.Trim())'"
+            & $enqueue 'nat' @{ SwitchName = $natName.Text.Trim(); Subnet = $natSubnet.Text.Trim(); GatewayIP = $natGw.Text.Trim(); NatName = $natNetName.Text.Trim() } 'Rede' "NAT Switch '$($natName.Text.Trim())'"
             $lblNet.Text = "Enfileirado (fila: $($jobQueue.Count)). Veja 'Log ao vivo'."
         } else {
             try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog
@@ -3314,7 +3369,7 @@ function Show-InstallerWpf {
         $lease = 7300; $tmp = 0
         if ([int]::TryParse($dhLease.Text.Trim(), [ref]$tmp) -and $tmp -gt 0) { $lease = $tmp }
         if ($Script:UseWorker) {
-            & $enqueue 'dhcp' @{ ScopeId = $dhScope.Text.Trim(); Mask = $dhMask.Text.Trim(); RangeFrom = $dhFrom.Text.Trim(); RangeTo = $dhTo.Text.Trim(); Gateway = $dhGw.Text.Trim(); Dns = $dhDns.Text.Trim(); Iface = $iface; LeaseDays = $lease } '' "DHCP NAT ($($dhScope.Text.Trim()))"
+            & $enqueue 'dhcp' @{ ScopeId = $dhScope.Text.Trim(); Mask = $dhMask.Text.Trim(); RangeFrom = $dhFrom.Text.Trim(); RangeTo = $dhTo.Text.Trim(); Gateway = $dhGw.Text.Trim(); Dns = $dhDns.Text.Trim(); Iface = $iface; LeaseDays = $lease } 'Rede' "DHCP NAT ($($dhScope.Text.Trim()))"
             $lblNet.Text = "Enfileirado (fila: $($jobQueue.Count)). Veja 'Log ao vivo'."
         } else {
             try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog
@@ -3377,7 +3432,7 @@ function Show-InstallerWpf {
     $btnUpdWinget.Add_Click({
         if (-not (Confirm-Wpf 'Atualizar TUDO que o winget tem pendente? Pode demorar.')) { return }
         if ($Script:UseWorker) {
-            & $enqueue 'updwinget' @{} '' 'winget upgrade --all'
+            & $enqueue 'updwinget' @{} 'Atualizacoes' 'winget upgrade --all'
             $lblUpd.Text = "Enfileirado (fila: $($jobQueue.Count)). Veja 'Log ao vivo'."
         } else {
             try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog; Update-AllWinget; $lblUpd.Text = 'winget upgrade --all executado (ver log/console).' }
@@ -3388,7 +3443,7 @@ function Show-InstallerWpf {
     $btnUpdChoco.Add_Click({
         if (-not (Confirm-Wpf 'Atualizar TUDO que o choco tem pendente? Pode demorar.')) { return }
         if ($Script:UseWorker) {
-            & $enqueue 'updchoco' @{} '' 'choco upgrade all'
+            & $enqueue 'updchoco' @{} 'Atualizacoes' 'choco upgrade all'
             $lblUpd.Text = "Enfileirado (fila: $($jobQueue.Count)). Veja 'Log ao vivo'."
         } else {
             try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog; Update-AllChoco; $lblUpd.Text = 'choco upgrade all executado (ver log/console).' }

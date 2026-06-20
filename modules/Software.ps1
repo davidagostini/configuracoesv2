@@ -346,9 +346,9 @@ function Invoke-SoftwareMenu {
     Write-Host ""
     Write-Host "  --- Softwares / Runtimes ---" -ForegroundColor Cyan
     Write-Host "  Gerenciador de instalacao:"
-    Write-Host "    1) winget   2) Chocolatey   3) auto (winget, fallback choco)"
-    $mraw = Read-Host "Escolha [1/2/3]"
-    $preferred = switch ($mraw) { '2' {'choco'} '3' {'auto'} default {'winget'} }
+    Write-Host "    1) Chocolatey (padrao)   2) winget   3) auto"
+    $mraw = Read-Host "Escolha [1/2/3] (ENTER = Chocolatey)"
+    $preferred = switch ($mraw) { '2' {'winget'} '3' {'auto'} default {'choco'} }
     Write-Log "Gerenciador selecionado: $preferred" -Level INFO
 
     if ($preferred -eq 'choco' -or $preferred -eq 'auto') {
