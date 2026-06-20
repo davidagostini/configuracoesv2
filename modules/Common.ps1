@@ -371,6 +371,8 @@ function Enable-OptionalFeatureSafe {
 # Resumo categorizado da sessao (instalados / reinicio / deferidos / falhas).
 function Show-FeaturesSummary {
     if ($Script:FeatureResults.Count -eq 0) { return }
+    # No worker (runspace sem console) Write-Host pode lancar/travar a thread.
+    if ($Script:NoConsole) { return }
 
     Write-Host ""
     Write-Host "  ============== RESUMO DA SESSAO ==============" -ForegroundColor Cyan

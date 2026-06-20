@@ -444,7 +444,7 @@ function Invoke-WorkerJob {
         }
         'dhcp'      {
             Reset-FeatureSession
-            if (-not (Install-DhcpRoleForNat)) { return }
+            if (-not (Install-DhcpRoleForNat)) { Show-FeaturesSummary; return }
             Set-NatDhcpScope -ScopeId $Job.Data.ScopeId -Mask $Job.Data.Mask `
                 -RangeFrom $Job.Data.RangeFrom -RangeTo $Job.Data.RangeTo `
                 -Gateway $Job.Data.Gateway -Dns $Job.Data.Dns -NatIface $Job.Data.Iface -LeaseDays $Job.Data.LeaseDays
@@ -496,15 +496,29 @@ function Start-InstallWorker {
         $ps.Runspace = $rs
         [void]$ps.AddScript({
             $env:WINCFG_NOUI = '1'
+            # Runspace sem host de UI: silenciar progresso evita que Install-WindowsFeature
+            # (Server Manager) e DISM travem esperando um host de Write-Progress inexistente.
+            $ProgressPreference = 'SilentlyContinue'
+            $WarningPreference  = 'SilentlyContinue'
             # (1) re-hidrata TODAS as funcoes/estado: mesmo texto-fonte da UI.
-            Invoke-Expression $WINCFG_SRC
+            try {
+                Invoke-Expression $WINCFG_SRC
+            } catch {
+                try { [void]$WINCFG_LIVE.Add("!! Falha ao re-hidratar o worker: $($_.Exception.Message)") } catch { }
+                try { $WINCFG_SIGNAL.Enqueue(@{ Type = 'WorkerDead'; Detail = $_.Exception.Message }) } catch { }
+                return
+            }
             # (2) religa as estruturas compartilhadas ao $Script: do worker.
             $Script:LiveLog = $WINCFG_LIVE
             $Script:NoConsole = $true   # worker NAO escreve no console (evita travar/lancar)
             if ($WINCFG_LOGDIR) { try { Set-LogDirectory -Path $WINCFG_LOGDIR } catch { } }
-            Import-UserSoftwareCatalog | Out-Null
-            # (3) laco serial: 1 job por vez.
+            try { Import-UserSoftwareCatalog | Out-Null } catch { }
+            # Sinaliza que a re-hidratacao concluiu (a UI so confia no worker apos isso).
+            try { [void]$WINCFG_LIVE.Add('==> Worker pronto.') } catch { }
+            try { $WINCFG_SIGNAL.Enqueue(@{ Type = 'WorkerReady' }) } catch { }
+            # (3) laco serial: 1 job por vez. try/catch externo: nunca morrer calado.
             while (-not $WINCFG_CTRL['Stop']) {
+              try {
                 $job = $null
                 [System.Threading.Monitor]::Enter($WINCFG_QUEUE.SyncRoot)
                 try { if ($WINCFG_QUEUE.Count -gt 0) { $job = $WINCFG_QUEUE.Dequeue() } }
@@ -524,11 +538,18 @@ function Start-InstallWorker {
                         # a flag sem registrar PrecisaReinicio) - so quando a fila esvaziar.
                         $rb = $false
                         try { $rb = [bool](Test-PendingReboot) } catch { }
+                        try {
+                            if (@($Script:FeatureResults | Where-Object { $_.Status -eq 'PrecisaReinicio' }).Count -gt 0) { $rb = $true }
+                        } catch { }
                         $WINCFG_SIGNAL.Enqueue(@{ Type = 'JobDone'; Label = $job.Label; Tab = $job.Tab; Reboot = $rb })
                     }
                 } else {
                     Start-Sleep -Milliseconds 150
                 }
+              } catch {
+                try { [void]$WINCFG_LIVE.Add("!! Erro no laco do worker: $($_.Exception.Message)") } catch { }
+                Start-Sleep -Milliseconds 200
+              }
             }
         })
         $async = $ps.BeginInvoke()
@@ -891,27 +912,36 @@ function Show-InstallerWpf {
 
     # ---- Async: fila serial + worker em runspace + log ao vivo ----
     $Script:LiveLog = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
+    # IMPORTANTE: o DispatcherTimer e criado com .GetNewClosure(), e um $Script:
+    # setado DENTRO desta funcao NAO e visivel la dentro (vira uma var vazia). Por
+    # isso o timer le este ALIAS LOCAL (mesmo objeto), igual ao $uiSignals/$jobQueue.
+    $liveSink  = $Script:LiveLog
     $jobQueue  = [System.Collections.Queue]::Synchronized([System.Collections.Queue]::new())
     $uiSignals = [System.Collections.Queue]::Synchronized([System.Collections.Queue]::new())
     $ctrl      = [hashtable]::Synchronized(@{ Stop = $false })
-    $Script:CurrentJobLabel = $null
-    $Script:RebootRequested = $false
+    # Estado compartilhado entre TODOS os closures (.GetNewClosure() nao compartilha
+    # $Script:; hashtable LOCAL e compartilhada por referencia - igual a $jobQueue).
+    $uiState = [hashtable]::Synchronized(@{ CurrentJobLabel = $null; RebootRequested = $false; DrainBusy = $false; WorkerReady = $false; ModalOpen = $false; Pending = 0; UseWorker = $false })
+    $defaultLogDir = $Script:DefaultLogDir
 
-    $logDir0 = if ($txtLog.Text.Trim()) { $txtLog.Text.Trim() } else { $Script:DefaultLogDir }
+    $logDir0 = if ($txtLog.Text.Trim()) { $txtLog.Text.Trim() } else { $defaultLogDir }
     $worker  = Start-InstallWorker -LiveLog $Script:LiveLog -JobQueue $jobQueue -UiSignals $uiSignals -Ctrl $ctrl -LogDir $logDir0
-    $Script:UseWorker = [bool]$worker
+    $uiState.UseWorker = [bool]$worker
 
     # Enfileira um job declarativo (chamado pelos handlers apos Confirm-Wpf).
     # Injeta a pasta de log atual no job -> o worker aplica antes de executar.
     $enqueue = {
         param([string] $Kind, $Data, [string] $Tab, [string] $Label)
         if (-not $Data) { $Data = @{} }
-        $Data.LogDir = if ($txtLog.Text.Trim()) { $txtLog.Text.Trim() } else { $Script:DefaultLogDir }
+        $Data.LogDir = if ($txtLog.Text.Trim()) { $txtLog.Text.Trim() } else { $defaultLogDir }
         # Mantem o ledger da UI apontando para o MESMO installer-state.json que o worker
         # vai gravar (Data.LogDir). Assim o repaint pos-job (Set-WpfStatusPanel /
         # Get-InstalledStateMap) le o arquivo correto, inclusive se o usuario mudou a pasta.
         try { Set-LogDirectory -Path $Data.LogDir } catch { }
         $jobQueue.Enqueue(@{ Kind = $Kind; Data = $Data; Tab = $Tab; Label = $Label })
+        # Desabilita os botoes enquanto houver job(s) enfileirado(s) -> evita duplo-enqueue.
+        $uiState.Pending = [int]$uiState.Pending + 1
+        & $setBusy $true
         $n = $jobQueue.Count
         $lblQueueFoot.Text = "Na fila: $n"
     }.GetNewClosure()
@@ -930,19 +960,18 @@ function Show-InstallerWpf {
 
     # DispatcherTimer: drena LiveLog -> painel e UiSignals -> repintura. Roda na
     # thread do Dispatcher (UI), entao mexer em controles WPF aqui e seguro.
-    $Script:DrainBusy = $false
     $logTimer = New-Object System.Windows.Threading.DispatcherTimer
     $logTimer.Interval = [TimeSpan]::FromMilliseconds(200)
     $logTimer.Add_Tick({
-        if ($Script:DrainBusy) { return }
-        $Script:DrainBusy = $true
+        if ($uiState.DrainBusy -or $uiState.ModalOpen) { return }
+        $uiState.DrainBusy = $true
         try {
             # (a) log ao vivo: snapshot + clear sob lock (nao perde linhas)
-            if ($Script:LiveLog.Count -gt 0) {
+            if ($liveSink.Count -gt 0) {
                 $chunk = $null
-                [System.Threading.Monitor]::Enter($Script:LiveLog.SyncRoot)
-                try { $chunk = @($Script:LiveLog.ToArray()); $Script:LiveLog.Clear() }
-                finally { [System.Threading.Monitor]::Exit($Script:LiveLog.SyncRoot) }
+                [System.Threading.Monitor]::Enter($liveSink.SyncRoot)
+                try { $chunk = @($liveSink.ToArray()); $liveSink.Clear() }
+                finally { [System.Threading.Monitor]::Exit($liveSink.SyncRoot) }
                 if ($chunk -and $chunk.Count) {
                     $txtLive.AppendText(($chunk -join "`r`n") + "`r`n")
                     if ($txtLive.Text.Length -gt 200000) { $txtLive.Text = $txtLive.Text.Substring($txtLive.Text.Length - 120000) }
@@ -956,10 +985,29 @@ function Show-InstallerWpf {
                 try { if ($uiSignals.Count -gt 0) { $s = $uiSignals.Dequeue() } }
                 finally { [System.Threading.Monitor]::Exit($uiSignals.SyncRoot) }
                 if (-not $s) { break }
-                if ($s.Type -eq 'JobStart') { $Script:CurrentJobLabel = $s.Label }
+                if ($s.Type -eq 'WorkerReady') { $uiState.WorkerReady = $true; continue }
+                if ($s.Type -eq 'WorkerDead') {
+                    $uiState.UseWorker = $false
+                    $uiState.WorkerReady = $false
+                    # O worker morreu sem reprocessar o que ja foi aceito: descarta os
+                    # jobs orfaos da fila, zera o contador de pendentes e reabilita os
+                    # botoes (senao a UI trava IsEnabled=$false para sempre).
+                    [System.Threading.Monitor]::Enter($jobQueue.SyncRoot)
+                    try { $jobQueue.Clear() } finally { [System.Threading.Monitor]::Exit($jobQueue.SyncRoot) }
+                    $uiState.CurrentJobLabel = $null
+                    $uiState.Pending = 0
+                    & $setBusy $false
+                    $lblQueue.Text = 'Ocioso.'
+                    $lblQueueFoot.Text = 'Ocioso.'
+                    $txtLive.AppendText("[modo sincrono] worker falhou: $($s.Detail) - fila descartada, use novamente (modo sincrono).`r`n")
+                    continue
+                }
+                if ($s.Type -eq 'JobStart') { $uiState.CurrentJobLabel = $s.Label }
                 elseif ($s.Type -eq 'JobDone') {
-                    $Script:CurrentJobLabel = $null
-                    if ($s.Reboot) { $Script:RebootRequested = $true }
+                    $uiState.CurrentJobLabel = $null
+                    $uiState.Pending = [Math]::Max(0, [int]$uiState.Pending - 1)
+                    if ($uiState.Pending -le 0) { & $setBusy $false }
+                    if ($s.Reboot) { $uiState.RebootRequested = $true }
                     & $repaintTab $s.Tab
                     # Confirma na propria aba que o job terminou (sem isso o rotulo
                     # ficava parado em "Enfileirado..." e parecia que nada acontecia).
@@ -976,20 +1024,23 @@ function Show-InstallerWpf {
             }
             # (c) indicador de fila
             $n = $jobQueue.Count
-            $cur = $Script:CurrentJobLabel
+            $cur = $uiState.CurrentJobLabel
             $txt = if ($cur) { "Executando: $cur   |   Na fila: $n" }
                    elseif ($n -gt 0) { "Na fila: $n" } else { 'Ocioso.' }
             $lblQueue.Text = $txt
             $lblQueueFoot.Text = $txt
             # (d) reinicio: oferece SO quando a fila esvazia e um job pediu reinicio
-            if ($Script:RebootRequested -and $jobQueue.Count -eq 0 -and -not $Script:CurrentJobLabel) {
-                $Script:RebootRequested = $false
-                Invoke-RebootOffer $win
+            if ($uiState.RebootRequested -and $jobQueue.Count -eq 0 -and -not $uiState.CurrentJobLabel) {
+                $uiState.RebootRequested = $false
+                # Enfileira o modal para DEPOIS deste Tick terminar (nao bloqueia o drain).
+                $null = $win.Dispatcher.BeginInvoke(
+                    [System.Windows.Threading.DispatcherPriority]::Background,
+                    [action]{ Invoke-RebootOffer $win })
             }
-        } finally { $Script:DrainBusy = $false }
+        } finally { $uiState.DrainBusy = $false }
     }.GetNewClosure())
     $logTimer.Start()
-    if (-not $Script:UseWorker) {
+    if (-not $uiState.UseWorker) {
         $txtLive.AppendText("[modo sincrono] worker indisponivel - a janela pode congelar durante operacoes longas.`r`n")
     }
 
@@ -1013,7 +1064,7 @@ function Show-InstallerWpf {
         if ($ids.Count -eq 0) { $lblFeat.Text = 'Nada selecionado.'; return }
         $names = @($ids | ForEach-Object { $id = $_; ($Script:CapabilityCatalog | Where-Object { $_.Id -eq $id } | Select-Object -First 1).Display })
         if (-not (Confirm-Wpf "Aplicar estas $($ids.Count) feature(s)?`n$(Format-ConfirmList $names)")) { return }
-        if ($Script:UseWorker) {
+        if ($uiState.UseWorker -and $uiState.WorkerReady) {
             & $enqueue 'features' @{ Ids = $ids } 'Features' "Features ($($ids.Count))"
             $lblFeat.Text = "Enfileirado (fila: $($jobQueue.Count)). Veja 'Log ao vivo'."
         } else {
@@ -1041,7 +1092,7 @@ function Show-InstallerWpf {
     })
     $btnChocoUpg.Add_Click({
         if (-not (Confirm-Wpf 'Executar "choco upgrade all"? Pode demorar.')) { return }
-        if ($Script:UseWorker) {
+        if ($uiState.UseWorker -and $uiState.WorkerReady) {
             & $enqueue 'updchoco' @{} 'Softwares' 'choco upgrade all'
             $lblSoft.Text = "Enfileirado (fila: $($jobQueue.Count)). Veja 'Log ao vivo'."
         } else {
@@ -1056,7 +1107,7 @@ function Show-InstallerWpf {
         $names = @($keys | ForEach-Object { $k = $_; ($Script:SoftwareCatalog | Where-Object { $_.Key -eq $k } | Select-Object -First 1).Name })
         if (-not (Confirm-Wpf "Instalar estes $($keys.Count) software(s)?`n$(Format-ConfirmList $names)")) { return }
         $pref = if ($rbChoco.IsChecked) { 'choco' } elseif ($rbAuto.IsChecked) { 'auto' } else { 'winget' }
-        if ($Script:UseWorker) {
+        if ($uiState.UseWorker -and $uiState.WorkerReady) {
             & $enqueue 'software' @{ Keys = $keys; Pref = $pref } 'Softwares' "Softwares ($($keys.Count))"
             $lblSoft.Text = "Enfileirado (fila: $($jobQueue.Count)). Veja 'Log ao vivo'."
         } else {
@@ -1083,7 +1134,7 @@ function Show-InstallerWpf {
         if ($feats.Count -eq 0 -and -not $doAspnet -and -not $doReset) { $lblIis.Text = 'Nada selecionado.'; return }
         $lst = @($feats); if ($doAspnet) { $lst += 'aspnet_state = Automatico' }; if ($doReset) { $lst += 'iisreset' }
         if (-not (Confirm-Wpf "Aplicar no IIS ($($lst.Count) item(ns))?`n$(Format-ConfirmList $lst)")) { return }
-        if ($Script:UseWorker) {
+        if ($uiState.UseWorker -and $uiState.WorkerReady) {
             & $enqueue 'iis' @{ Feats = $feats; Aspnet = $doAspnet; Reset = $doReset } 'IIS' "IIS ($($lst.Count))"
             $lblIis.Text = "Enfileirado (fila: $($jobQueue.Count)). Veja 'Log ao vivo'."
         } else {
@@ -1099,7 +1150,7 @@ function Show-InstallerWpf {
     })
     $btnIisFull.Add_Click({
         if (-not (Confirm-Wpf "Instalar IIS COMPLETO ($($Script:IISFeatures.Count) features) + aspnet_state + iisreset? Pode demorar.")) { return }
-        if ($Script:UseWorker) {
+        if ($uiState.UseWorker -and $uiState.WorkerReady) {
             & $enqueue 'iisfull' @{} 'IIS' 'IIS COMPLETO'
             $lblIis.Text = "Enfileirado (fila: $($jobQueue.Count)). Veja 'Log ao vivo'."
         } else {
@@ -1110,7 +1161,7 @@ function Show-InstallerWpf {
     })
     $btnAspNet.Add_Click({
         if (-not (Confirm-Wpf 'Definir o servico aspnet_state como Automatico?')) { return }
-        if ($Script:UseWorker) {
+        if ($uiState.UseWorker -and $uiState.WorkerReady) {
             & $enqueue 'aspnet' @{} 'IIS' 'aspnet_state=Auto'
             $lblIis.Text = "Enfileirado (fila: $($jobQueue.Count)). Veja 'Log ao vivo'."
         } else {
@@ -1120,7 +1171,7 @@ function Show-InstallerWpf {
     })
     $btnIisReset.Add_Click({
         if (-not (Confirm-Wpf 'Executar iisreset agora?')) { return }
-        if ($Script:UseWorker) {
+        if ($uiState.UseWorker -and $uiState.WorkerReady) {
             & $enqueue 'iisreset' @{} 'IIS' 'iisreset'
             $lblIis.Text = "Enfileirado (fila: $($jobQueue.Count)). Veja 'Log ao vivo'."
         } else {
@@ -1132,7 +1183,7 @@ function Show-InstallerWpf {
     # --- Rede: NAT ---
     $btnNat.Add_Click({
         if (-not (Confirm-Wpf "Criar/atualizar o NAT Switch '$($natName.Text.Trim())' ($($natSubnet.Text.Trim()))?")) { return }
-        if ($Script:UseWorker) {
+        if ($uiState.UseWorker -and $uiState.WorkerReady) {
             & $enqueue 'nat' @{ SwitchName = $natName.Text.Trim(); Subnet = $natSubnet.Text.Trim(); GatewayIP = $natGw.Text.Trim(); NatName = $natNetName.Text.Trim() } 'Rede' "NAT Switch '$($natName.Text.Trim())'"
             $lblNet.Text = "Enfileirado (fila: $($jobQueue.Count)). Veja 'Log ao vivo'."
         } else {
@@ -1185,7 +1236,7 @@ function Show-InstallerWpf {
         if (-not $iface) { $lblNet.Text = 'Clique "Detectar rede NAT" antes de aplicar o DHCP.'; return }
         $lease = 7300; $tmp = 0
         if ([int]::TryParse($dhLease.Text.Trim(), [ref]$tmp) -and $tmp -gt 0) { $lease = $tmp }
-        if ($Script:UseWorker) {
+        if ($uiState.UseWorker -and $uiState.WorkerReady) {
             & $enqueue 'dhcp' @{ ScopeId = $dhScope.Text.Trim(); Mask = $dhMask.Text.Trim(); RangeFrom = $dhFrom.Text.Trim(); RangeTo = $dhTo.Text.Trim(); Gateway = $dhGw.Text.Trim(); Dns = $dhDns.Text.Trim(); Iface = $iface; LeaseDays = $lease } 'Rede' "DHCP NAT ($($dhScope.Text.Trim()))"
             $lblNet.Text = "Enfileirado (fila: $($jobQueue.Count)). Veja 'Log ao vivo'."
         } else {
@@ -1210,7 +1261,7 @@ function Show-InstallerWpf {
         $tags = @(Get-WpfCheckedTags $spSystem)
         if ($tags.Count -eq 0) { $lblSys.Text = 'Nada selecionado.'; return }
         if (-not (Confirm-Wpf "Aplicar os $($tags.Count) item(ns) marcado(s)?")) { return }
-        if ($Script:UseWorker) {
+        if ($uiState.UseWorker -and $uiState.WorkerReady) {
             & $enqueue 'system' @{ Tags = $tags } 'Sistema' "Sistema ($($tags.Count))"
             $lblSys.Text = "Enfileirado (fila: $($jobQueue.Count)). Veja 'Log ao vivo'."
             return
@@ -1248,7 +1299,7 @@ function Show-InstallerWpf {
     })
     $btnUpdWinget.Add_Click({
         if (-not (Confirm-Wpf 'Atualizar TUDO que o winget tem pendente? Pode demorar.')) { return }
-        if ($Script:UseWorker) {
+        if ($uiState.UseWorker -and $uiState.WorkerReady) {
             & $enqueue 'updwinget' @{} 'Atualizacoes' 'winget upgrade --all'
             $lblUpd.Text = "Enfileirado (fila: $($jobQueue.Count)). Veja 'Log ao vivo'."
         } else {
@@ -1259,7 +1310,7 @@ function Show-InstallerWpf {
     })
     $btnUpdChoco.Add_Click({
         if (-not (Confirm-Wpf 'Atualizar TUDO que o choco tem pendente? Pode demorar.')) { return }
-        if ($Script:UseWorker) {
+        if ($uiState.UseWorker -and $uiState.WorkerReady) {
             & $enqueue 'updchoco' @{} 'Atualizacoes' 'choco upgrade all'
             $lblUpd.Text = "Enfileirado (fila: $($jobQueue.Count)). Veja 'Log ao vivo'."
         } else {
@@ -1270,7 +1321,7 @@ function Show-InstallerWpf {
     })
 
     $win.Add_Closing({
-        if (($jobQueue.Count -gt 0 -or $Script:CurrentJobLabel) -and
+        if (($jobQueue.Count -gt 0 -or $uiState.CurrentJobLabel) -and
             -not (Confirm-Wpf 'Ha instalacao em andamento ou na fila. Fechar pode interromper. Sair?')) {
             $_.Cancel = $true; return
         }
@@ -1278,7 +1329,6 @@ function Show-InstallerWpf {
         $ctrl['Stop'] = $true
         try { if ($worker) { $worker.Ps.Stop(); $worker.Rs.Close(); $worker.Rs.Dispose() } } catch { }
         try { Remove-Item Env:\WINCFG_NOUI -ErrorAction SilentlyContinue } catch { }
-        $Script:LiveLog = $null
     }.GetNewClosure())
 
     $null = $win.ShowDialog()

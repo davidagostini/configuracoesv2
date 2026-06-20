@@ -77,7 +77,7 @@ function New-Capability {
 
 $Script:CapabilityCatalog = @(
     (New-Capability 'HyperV'        'Hyper-V'                         'Virtualizacao' 'Both'       @() '' -Notes 'Requer reinicio (auto no Server)' -InstallFn 'Install-HyperVRole')
-    (New-Capability 'Containers'    'Containers'                     'Virtualizacao' 'Both'       @('Containers') 'Containers')
+    (New-Capability 'Containers'    'Containers'                     'Virtualizacao' 'Both'       @('Containers') '')
     (New-Capability 'Sandbox'       'Windows Sandbox'                'Virtualizacao' 'ClientOnly' @('Containers-DisposableClientVM'))
     (New-Capability 'WSL'           'WSL'                            'Virtualizacao' 'Both'       @() '' -Notes 'wsl --update' -InstallFn 'Update-Wsl')
     (New-Capability 'Telnet'        'Telnet Client'                  'Rede'          'Both'       @('TelnetClient'))

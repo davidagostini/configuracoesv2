@@ -375,8 +375,16 @@ function Set-NatDhcpScope {
             Write-Log "Nao foi possivel definir o lease em $LeaseDays dias: $($_.Exception.Message)" -Level WARN
         }
 
-        # 3) Exclui o gateway da distribuicao (seguranca)
-        Add-DhcpServerv4ExclusionRange -ScopeId $ScopeId -StartRange $Gateway -EndRange $Gateway -ErrorAction SilentlyContinue
+        # 3) Exclui o gateway da distribuicao (seguranca). IDEMPOTENTE: o cmdlet lanca
+        # erro TERMINANTE (que -ErrorAction SilentlyContinue NAO segura) se a exclusao
+        # ja existe. O try/catch evita quebrar o resto ao reaplicar o DHCP (bug
+        # relatado: "Failed to add exclusion range ... already ...").
+        try {
+            Add-DhcpServerv4ExclusionRange -ScopeId $ScopeId -StartRange $Gateway -EndRange $Gateway -ErrorAction Stop
+            Write-Log "Gateway $Gateway excluido da distribuicao." -Level OK
+        } catch {
+            Write-Log "Exclusao do gateway $Gateway nao aplicada (provavelmente ja existe) - ignorando." -Level WARN
+        }
 
         # 4) Opcoes 003 (gateway) e 006 (DNS)
         Set-DhcpServerv4OptionValue -ScopeId $ScopeId -Router $Gateway -DnsServer $Dns
