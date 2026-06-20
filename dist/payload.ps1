@@ -28,6 +28,11 @@ if ($PSScriptRoot) {
 # mostrar o que ja rodou / o que precisa de reinicio / o que ficou deferido.
 $Script:StateFile = Join-Path (Split-Path $Script:LogFile -Parent) 'installer-state.json'
 
+# Sink opcional de log ao vivo: quando a GUI (ou o worker) cria esta colecao
+# sincronizada, Write-Log empurra cada linha aqui alem do arquivo/console. Um
+# DispatcherTimer na UI drena para o painel. Mesma referencia nos dois runspaces.
+$Script:LiveLog = $null
+
 # Define a pasta onde os logs serao gravados (campo "Pasta de log" da tela).
 # Gera um arquivo por execucao com timestamp passado pelo chamador, ou o
 # install.log padrao quando -FileName nao e informado.
@@ -74,6 +79,8 @@ function Write-Log {
         default { '  -    ' }
     }
     Write-Host "$prefix$Message" -ForegroundColor $color
+
+    if ($null -ne $Script:LiveLog) { try { [void]$Script:LiveLog.Add($line) } catch { } }
 }
 
 # --- Verificacao de privilegios -------------------------------------------
@@ -454,13 +461,17 @@ function New-Capability {
     param(
         $Id, $Display, $Category, $AvailableOn = 'Both',
         $Features = @(), $ServerRole = '',
-        [switch] $IncludeManagementTools, [switch] $NeedsSource, $Notes = ''
+        [switch] $IncludeManagementTools, [switch] $NeedsSource, $Notes = '',
+        # InstallFn: nome de uma funcao que faz a instalacao por conta propria
+        # (ex.: OpenSSH via Add-WindowsCapability, WSL via 'wsl --update'). Quando
+        # presente, o dispatch chama essa funcao em vez do caminho DISM/ServerRole.
+        $InstallFn = ''
     )
     [PSCustomObject]@{
         Id          = $Id; Display = $Display; Category = $Category
         AvailableOn = $AvailableOn; Features = @($Features); ServerRole = $ServerRole
         IncludeManagementTools = [bool]$IncludeManagementTools
-        NeedsSource = [bool]$NeedsSource; Notes = $Notes
+        NeedsSource = [bool]$NeedsSource; Notes = $Notes; InstallFn = $InstallFn
     }
 }
 
@@ -468,7 +479,9 @@ $Script:CapabilityCatalog = @(
     (New-Capability 'HyperV'        'Hyper-V'                         'Virtualizacao' 'Both'       @('Microsoft-Hyper-V-All') 'Hyper-V' -IncludeManagementTools -Notes 'Requer reinicio')
     (New-Capability 'Containers'    'Containers'                     'Virtualizacao' 'Both'       @('Containers') 'Containers')
     (New-Capability 'Sandbox'       'Windows Sandbox'                'Virtualizacao' 'ClientOnly' @('Containers-DisposableClientVM'))
+    (New-Capability 'WSL'           'WSL'                            'Virtualizacao' 'Both'       @() '' -Notes 'wsl --update' -InstallFn 'Update-Wsl')
     (New-Capability 'Telnet'        'Telnet Client'                  'Rede'          'Both'       @('TelnetClient'))
+    (New-Capability 'OpenSSH'       'OpenSSH Server'                 'Rede'          'Both'       @() '' -Notes 'sshd + firewall 22' -InstallFn 'Install-OpenSSHServer')
     (New-Capability 'IISCore'       'IIS - Servidor Web'             'Web/IIS'       'Both'       @('IIS-WebServerRole','IIS-WebServer'))
     (New-Capability 'IISAspNet'     'IIS - ASP.NET 4.x'              'Web/IIS'       'Both'       @('IIS-ASPNET45'))
     (New-Capability 'IISMgmt'       'IIS - Console de Gerenciamento' 'Web/IIS'       'Both'       @('IIS-ManagementConsole','IIS-ManagementScriptingTools','IIS-ManagementService'))
@@ -497,6 +510,14 @@ function Install-Capability {
         [string] $Source   # midia opcional p/ NetFx3 (FoD)
     )
     $role = Get-OSRole
+
+    # Acao custom: a capability aponta uma funcao que instala por conta propria
+    # (OpenSSH via Add-WindowsCapability, WSL via 'wsl --update'). Ela ja registra
+    # o resultado via Add-FeatureResult.
+    if ($Capability.InstallFn) {
+        & $Capability.InstallFn
+        return
+    }
 
     # Bifurcacao: role de Server quando ha ServerManager (Hyper-V, Containers).
     if ($Capability.ServerRole -and $role.HasServerManager) {
@@ -774,7 +795,7 @@ function Install-OpenSSHServer {
 # --- WSL (atualizacao do kernel/componentes) -------------------------------
 # Roda 'wsl --update'. Nao instala distro; so atualiza o WSL ja presente no SO.
 function Update-Wsl {
-    $name = 'WSL (update)'
+    $name = 'WSL'
     Write-Log "Atualizando o WSL (wsl --update)..." -Level STEP
     if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
         Write-Log "wsl.exe nao encontrado neste SO." -Level WARN
@@ -2153,10 +2174,10 @@ function Start-MainMenu {
 #  Software.ps1, Customizations.ps1, BaseConfig.ps1 e Gui.ps1.
 #
 #  Modelo: janela FICA ABERTA (sessao iterativa); cada aba tem seu "Aplicar".
-#  Operacoes pesadas pedem CONFIRMACAO e desabilitam os botoes durante a execucao
-#  (evita clique enfileirado disparar acao por engano enquanto a UI esta ocupada).
-#  Operacoes longas rodam de forma sincrona - a janela pode ficar momentaneamente
-#  irresponsiva; o log ao vivo sai no console.
+#  Operacoes pesadas pedem CONFIRMACAO e sao ENFILEIRADAS num worker em runspace
+#  separado (fila serial) -> a janela NAO congela; da pra navegar enquanto roda.
+#  A aba "Log ao vivo" mostra o andamento (um DispatcherTimer drena o log do worker).
+#  Se o worker nao iniciar, ha FALLBACK sincrono (igual ao comportamento antigo).
 #  Cada item ja instalado mostra "[feito em <data>]" ao lado (verde); clicar nessa
 #  marca abre um popup com o registro (JSON) daquele item do ledger.
 #  Aba "Status" le o ledger persistente (installer-state.json) e mostra, ao abrir
@@ -2534,6 +2555,153 @@ function Show-AddSoftwareDialog {
     return $w.Tag
 }
 
+# ============================================================================
+#  Infra de execucao assincrona: worker em runspace + fila serial + log vivo
+#  A UI nunca executa trabalho pesado; ela ENFILEIRA. Um unico worker consome
+#  a fila em serie (nunca dois choco/winget juntos). Toda atualizacao de UI
+#  ocorre na thread do Dispatcher (DispatcherTimer / $win.Dispatcher).
+# ============================================================================
+
+# Fonte completa dos modulos para re-hidratar o worker. IRM: usa o payload ja
+# capturado no bootstrap-head. DEV: concatena modules\*.ps1 na ordem do build.
+# Retorna $null se nao houver fonte (=> fallback sincrono).
+function Get-InstallerSource {
+    if ($global:WINCFG_PAYLOAD_SRC) { return $global:WINCFG_PAYLOAD_SRC }
+    if ($PSScriptRoot) {
+        $order = 'Common','OSCommon','Customizations','WindowsFeatures','BaseConfig','IIS','Software','Gui','GuiWpf'
+        $sb = New-Object System.Text.StringBuilder
+        foreach ($n in $order) {
+            $f = Join-Path $PSScriptRoot "$n.ps1"
+            if (Test-Path $f) { [void]$sb.AppendLine((Get-Content -LiteralPath $f -Raw)) }
+        }
+        if ($sb.Length -gt 0) { return $sb.ToString() }
+    }
+    return $null
+}
+
+# Despacho declarativo de um job no WORKER (usa as funcoes ja re-hidratadas).
+# Jobs sao hashtables de dados (nunca scriptblocks) -> seguro cruzar runspace.
+function Invoke-WorkerJob {
+    param($Job)
+    switch ($Job.Kind) {
+        'setlog'    { if ($Job.Data.Path) { Set-LogDirectory -Path $Job.Data.Path } }
+        'features'  { Invoke-CapabilityInstall -Ids $Job.Data.Ids }
+        'software'  {
+            Reset-FeatureSession
+            foreach ($k in $Job.Data.Keys) {
+                $pkg = $Script:SoftwareCatalog | Where-Object { $_.Key -eq $k } | Select-Object -First 1
+                if ($pkg) { Install-SoftwarePackage -Pkg $pkg -Preferred $Job.Data.Pref }
+            }
+            Show-FeaturesSummary
+        }
+        'iis'       {
+            Reset-FeatureSession
+            foreach ($f in $Job.Data.Feats) { Enable-OptionalFeatureSafe -FeatureName $f -All }
+            if ($Job.Data.Aspnet) { Set-AspNetStateAuto }
+            if ($Job.Data.Reset)  { Invoke-IISReset }
+            Show-FeaturesSummary
+        }
+        'iisfull'   { Reset-FeatureSession; Install-IISFull; Show-FeaturesSummary }
+        'aspnet'    { Reset-FeatureSession; Set-AspNetStateAuto; Show-FeaturesSummary }
+        'iisreset'  { Reset-FeatureSession; Invoke-IISReset; Show-FeaturesSummary }
+        'nat'       {
+            Reset-FeatureSession
+            if ($Job.Data.NatName) {
+                New-NatSwitch -SwitchName $Job.Data.SwitchName -Subnet $Job.Data.Subnet -GatewayIP $Job.Data.GatewayIP -NatName $Job.Data.NatName
+            } else {
+                New-NatSwitch -SwitchName $Job.Data.SwitchName -Subnet $Job.Data.Subnet -GatewayIP $Job.Data.GatewayIP
+            }
+        }
+        'dhcp'      {
+            Reset-FeatureSession
+            if (-not (Install-DhcpRoleForNat)) { return }
+            Set-NatDhcpScope -ScopeId $Job.Data.ScopeId -Mask $Job.Data.Mask `
+                -RangeFrom $Job.Data.RangeFrom -RangeTo $Job.Data.RangeTo `
+                -Gateway $Job.Data.Gateway -Dns $Job.Data.Dns -NatIface $Job.Data.Iface -LeaseDays $Job.Data.LeaseDays
+        }
+        'system'    {
+            Reset-FeatureSession
+            $restartExplorer = $false
+            foreach ($t in $Job.Data.Tags) {
+                switch ($t) {
+                    'dark'        { $c = Enable-DarkMode;        Add-FeatureResult -Name 'Dark Mode' -Status $(if ($c) {'Instalado'} else {'JaPresente'}); $restartExplorer = $restartExplorer -or $c }
+                    'ext'         { $c = Show-FileExtensions;    Add-FeatureResult -Name 'Mostrar extensoes' -Status $(if ($c) {'Instalado'} else {'JaPresente'}); $restartExplorer = $restartExplorer -or $c }
+                    'hidden'      { $c = Show-HiddenFiles;       Add-FeatureResult -Name 'Mostrar ocultos' -Status $(if ($c) {'Instalado'} else {'JaPresente'}); $restartExplorer = $restartExplorer -or $c }
+                    'superhidden' { $c = Show-HiddenFiles -IncludeProtectedOsFiles; Add-FeatureResult -Name 'Mostrar ocultos (+protegidos)' -Status $(if ($c) {'Instalado'} else {'JaPresente'}); $restartExplorer = $restartExplorer -or $c }
+                    'printscr'    { $c = Disable-PrintScreenSnipping; Add-FeatureResult -Name 'Print Screen (Snipping off)' -Status $(if ($c) {'Instalado'} else {'JaPresente'}) }
+                    'ieesc'       { try { Disable-IEEsc;                 Add-FeatureResult -Name 'IE ESC desativado' -Status 'Instalado' } catch { Add-FeatureResult -Name 'IE ESC desativado' -Status 'Falha' -Detail $_.Exception.Message } }
+                    'tz'          { try { Set-TimeZoneBrasilia;          Add-FeatureResult -Name 'Time zone Brasilia' -Status 'Instalado' } catch { Add-FeatureResult -Name 'Time zone Brasilia' -Status 'Falha' -Detail $_.Exception.Message } }
+                    'datetime'    { try { if (Sync-DateTime) { Add-FeatureResult -Name 'Data e hora' -Status 'Instalado' } else { Add-FeatureResult -Name 'Data e hora' -Status 'Falha' -Detail 'Nao obteve a hora via HTTP' } } catch { Add-FeatureResult -Name 'Data e hora' -Status 'Falha' -Detail $_.Exception.Message } }
+                    'srvmgr'      { try { Disable-ServerManagerAutoStart; Add-FeatureResult -Name 'Server Manager no logon (off)' -Status 'Instalado' } catch { Add-FeatureResult -Name 'Server Manager no logon (off)' -Status 'Falha' -Detail $_.Exception.Message } }
+                }
+            }
+            if ($restartExplorer) { Restart-Explorer }
+        }
+        'updchoco'  { Update-AllChoco }
+        'updwinget' { Update-AllWinget }
+    }
+}
+
+# Sobe o worker: runspace STA que re-hidrata a fonte e roda o laco serial.
+# Retorna o handle (ou $null -> fallback sincrono). Estruturas compartilhadas
+# por referencia: $LiveLog, $JobQueue, $UiSignals, $Ctrl (flag de stop).
+function Start-InstallWorker {
+    param($LiveLog, $JobQueue, $UiSignals, $Ctrl, [string] $LogDir)
+    $src = Get-InstallerSource
+    if (-not $src) { return $null }
+    try {
+        $rs = [runspacefactory]::CreateRunspace()
+        $rs.ApartmentState = 'STA'
+        $rs.ThreadOptions  = 'ReuseThread'
+        $rs.Open()
+        $p = $rs.SessionStateProxy
+        $p.SetVariable('WINCFG_SRC',    $src)
+        $p.SetVariable('WINCFG_LIVE',   $LiveLog)
+        $p.SetVariable('WINCFG_QUEUE',  $JobQueue)
+        $p.SetVariable('WINCFG_SIGNAL', $UiSignals)
+        $p.SetVariable('WINCFG_CTRL',   $Ctrl)
+        $p.SetVariable('WINCFG_LOGDIR', $LogDir)
+        $env:WINCFG_NOUI = '1'   # impede o tail (na fonte) de abrir 2a janela
+        $ps = [powershell]::Create()
+        $ps.Runspace = $rs
+        [void]$ps.AddScript({
+            $env:WINCFG_NOUI = '1'
+            # (1) re-hidrata TODAS as funcoes/estado: mesmo texto-fonte da UI.
+            Invoke-Expression $WINCFG_SRC
+            # (2) religa as estruturas compartilhadas ao $Script: do worker.
+            $Script:LiveLog = $WINCFG_LIVE
+            if ($WINCFG_LOGDIR) { try { Set-LogDirectory -Path $WINCFG_LOGDIR } catch { } }
+            Import-UserSoftwareCatalog | Out-Null
+            # (3) laco serial: 1 job por vez.
+            while (-not $WINCFG_CTRL['Stop']) {
+                $job = $null
+                [System.Threading.Monitor]::Enter($WINCFG_QUEUE.SyncRoot)
+                try { if ($WINCFG_QUEUE.Count -gt 0) { $job = $WINCFG_QUEUE.Dequeue() } }
+                finally { [System.Threading.Monitor]::Exit($WINCFG_QUEUE.SyncRoot) }
+                if ($job) {
+                    try {
+                        $WINCFG_SIGNAL.Enqueue(@{ Type = 'JobStart'; Label = $job.Label; Tab = $job.Tab })
+                        if ($job.Data -and $job.Data.LogDir) { try { Set-LogDirectory -Path $job.Data.LogDir } catch { } }
+                        Invoke-WorkerJob -Job $job
+                    } catch {
+                        Write-Log "Falha no job '$($job.Label)': $($_.Exception.Message)" -Level ERRO
+                    } finally {
+                        $WINCFG_SIGNAL.Enqueue(@{ Type = 'JobDone'; Label = $job.Label; Tab = $job.Tab })
+                    }
+                } else {
+                    Start-Sleep -Milliseconds 150
+                }
+            }
+        })
+        $async = $ps.BeginInvoke()
+        return [pscustomobject]@{ Rs = $rs; Ps = $ps; Async = $async }
+    } catch {
+        Write-Log "Worker indisponivel ($($_.Exception.Message)); modo sincrono." -Level WARN
+        try { Remove-Item Env:\WINCFG_NOUI -ErrorAction SilentlyContinue } catch { }
+        return $null
+    }
+}
+
 function Show-InstallerWpf {
     Add-Type -AssemblyName PresentationFramework -ErrorAction Stop
 
@@ -2574,6 +2742,8 @@ function Show-InstallerWpf {
         <Label Content="Pasta de log:" DockPanel.Dock="Left" VerticalAlignment="Center"/>
         <TextBox x:Name="txtLog" Width="360" DockPanel.Dock="Left" Margin="6,0,0,0" VerticalAlignment="Center"/>
         <Button x:Name="btnClose" Content="Fechar" DockPanel.Dock="Right" Width="90" Height="30"/>
+        <TextBlock x:Name="lblQueueFoot" DockPanel.Dock="Right" VerticalAlignment="Center"
+                   Margin="0,0,16,0" Foreground="#FF9CDCFE" Text="Ocioso."/>
       </DockPanel>
     </Border>
     <TabControl x:Name="tabs" Background="#FF1E1E1E" BorderBrush="#FF3F3F46" Margin="6">
@@ -2595,17 +2765,11 @@ function Show-InstallerWpf {
 
       <TabItem Header="Features">
         <DockPanel Background="#FF1E1E1E">
-          <StackPanel DockPanel.Dock="Top" Margin="12,8">
-            <StackPanel Orientation="Horizontal">
-              <Button x:Name="btnFeatAll" Content="Selecionar tudo" Width="130" Height="28"/>
-              <Button x:Name="btnFeatNone" Content="Limpar" Width="90" Height="28"/>
-              <Button x:Name="btnFeatApply" Content="Aplicar selecionados" Width="180" Height="28" Background="#FF1E7D34" BorderBrush="#FF1E7D34"/>
-              <TextBlock x:Name="lblFeat" Margin="12,0,0,0" VerticalAlignment="Center" Foreground="#FF9CDCFE"/>
-            </StackPanel>
-            <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
-              <Button x:Name="btnSsh" Content="Instalar OpenSSH Server" Width="190" Height="28"/>
-              <Button x:Name="btnWsl" Content="Atualizar WSL (wsl --update)" Width="200" Height="28"/>
-            </StackPanel>
+          <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="12,8">
+            <Button x:Name="btnFeatAll" Content="Selecionar tudo" Width="130" Height="28"/>
+            <Button x:Name="btnFeatNone" Content="Limpar" Width="90" Height="28"/>
+            <Button x:Name="btnFeatApply" Content="Aplicar selecionados" Width="180" Height="28" Background="#FF1E7D34" BorderBrush="#FF1E7D34"/>
+            <TextBlock x:Name="lblFeat" Margin="12,0,0,0" VerticalAlignment="Center" Foreground="#FF9CDCFE"/>
           </StackPanel>
           <ScrollViewer VerticalScrollBarVisibility="Auto" Background="#FF1E1E1E">
             <StackPanel x:Name="spFeatures" Margin="12"/>
@@ -2747,6 +2911,20 @@ function Show-InstallerWpf {
         </DockPanel>
       </TabItem>
 
+      <TabItem Header="Log ao vivo">
+        <DockPanel Background="#FF1E1E1E">
+          <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="12,8">
+            <TextBlock x:Name="lblQueue" VerticalAlignment="Center" Foreground="#FF9CDCFE" Text="Ocioso."/>
+            <Button x:Name="btnLogClear" Content="Limpar painel" Width="120" Height="26" Margin="16,0,0,0"/>
+            <Button x:Name="btnCancelQueue" Content="Cancelar fila" Width="120" Height="26"
+                    Background="#FF6E1E1E" BorderBrush="#FF6E1E1E"/>
+          </StackPanel>
+          <TextBox x:Name="txtLive" Margin="12" IsReadOnly="True" TextWrapping="NoWrap" FontFamily="Consolas"
+                   VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
+                   Background="#FF101010" Foreground="#FFCFCFCF" BorderBrush="#FF3F3F46"/>
+        </DockPanel>
+      </TabItem>
+
     </TabControl>
   </DockPanel>
 </Window>
@@ -2778,7 +2956,6 @@ function Show-InstallerWpf {
     $lblReboot = $win.FindName('lblReboot'); $spStatus = $win.FindName('spStatus')
     $btnRefresh = $win.FindName('btnRefresh'); $btnClearState = $win.FindName('btnClearState')
     $spFeatures = $win.FindName('spFeatures'); $btnFeatAll = $win.FindName('btnFeatAll'); $btnFeatNone = $win.FindName('btnFeatNone'); $btnFeatApply = $win.FindName('btnFeatApply'); $lblFeat = $win.FindName('lblFeat')
-    $btnSsh = $win.FindName('btnSsh'); $btnWsl = $win.FindName('btnWsl')
     $rbChoco = $win.FindName('rbChoco'); $rbAuto = $win.FindName('rbAuto')
     $rbFiltAll = $win.FindName('rbFiltAll'); $rbFiltWinget = $win.FindName('rbFiltWinget'); $rbFiltChoco = $win.FindName('rbFiltChoco')
     $spSoftware = $win.FindName('spSoftware'); $btnSoftAll = $win.FindName('btnSoftAll'); $btnSoftNone = $win.FindName('btnSoftNone')
@@ -2794,9 +2971,19 @@ function Show-InstallerWpf {
     $btnStartupUser = $win.FindName('btnStartupUser'); $btnStartupAll = $win.FindName('btnStartupAll'); $lblSys = $win.FindName('lblSys')
     $btnUpdCheck = $win.FindName('btnUpdCheck'); $btnUpdWinget = $win.FindName('btnUpdWinget'); $btnUpdChoco = $win.FindName('btnUpdChoco')
     $txtUpd = $win.FindName('txtUpd'); $lblUpd = $win.FindName('lblUpd')
+    $txtLive = $win.FindName('txtLive'); $lblQueue = $win.FindName('lblQueue')
+    $lblQueueFoot = $win.FindName('lblQueueFoot')
+    $btnLogClear = $win.FindName('btnLogClear'); $btnCancelQueue = $win.FindName('btnCancelQueue')
 
     $txtLog.Text = $Script:DefaultLogDir
     $ui = @{ Nets = @(); Iface = '' }
+
+    # Sincroniza o ledger ($Script:StateFile/$Script:LogFile) da thread da UI com a
+    # pasta de log efetiva ANTES do primeiro repaint. Sem isso, no caminho async a UI
+    # leria de uma pasta (derivada de $PSScriptRoot no init de Common.ps1) diferente da
+    # que o worker grava ($job.Data.LogDir = DefaultLogDir), e a aba Status / marcas
+    # '[feito em ...]' nunca refletiriam o que o worker acabou de fazer.
+    if ($txtLog.Text.Trim()) { try { Set-LogDirectory -Path $txtLog.Text.Trim() } catch { } }
 
     Add-WpfFeatureItems $spFeatures $win
     Add-WpfSoftwareItems $spSoftware 'all' $win
@@ -2805,13 +2992,106 @@ function Show-InstallerWpf {
     Set-WpfStatusPanel $spStatus $lblReboot
 
     # Botoes que devem ser desabilitados durante uma operacao.
-    $actionButtons = @($btnFeatApply, $btnFeatAll, $btnFeatNone, $btnSsh, $btnWsl, $btnSoftApply, $btnSoftAll, $btnSoftNone,
+    $actionButtons = @($btnFeatApply, $btnFeatAll, $btnFeatNone, $btnSoftApply, $btnSoftAll, $btnSoftNone,
         $btnChocoUpg, $btnAddSoft, $btnIisApply, $btnIisAll, $btnIisNone, $btnIisFull, $btnAspNet, $btnIisReset,
         $btnNat, $btnDetect, $btnDhcp, $btnSysApply, $btnSysAll, $btnSysNone, $btnStartupUser, $btnStartupAll,
         $btnUpdCheck, $btnUpdWinget, $btnUpdChoco)
     $setBusy = { param([bool] $b) foreach ($x in $actionButtons) { if ($x) { $x.IsEnabled = -not $b } } }
     $applyLog = { if ($txtLog.Text.Trim()) { Set-LogDirectory -Path $txtLog.Text.Trim() } }
     $softFilter = { if ($rbFiltWinget.IsChecked) { 'winget' } elseif ($rbFiltChoco.IsChecked) { 'choco' } else { 'all' } }
+
+    # ---- Async: fila serial + worker em runspace + log ao vivo ----
+    $Script:LiveLog = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
+    $jobQueue  = [System.Collections.Queue]::Synchronized([System.Collections.Queue]::new())
+    $uiSignals = [System.Collections.Queue]::Synchronized([System.Collections.Queue]::new())
+    $ctrl      = [hashtable]::Synchronized(@{ Stop = $false })
+    $Script:CurrentJobLabel = $null
+
+    $logDir0 = if ($txtLog.Text.Trim()) { $txtLog.Text.Trim() } else { $Script:DefaultLogDir }
+    $worker  = Start-InstallWorker -LiveLog $Script:LiveLog -JobQueue $jobQueue -UiSignals $uiSignals -Ctrl $ctrl -LogDir $logDir0
+    $Script:UseWorker = [bool]$worker
+
+    # Enfileira um job declarativo (chamado pelos handlers apos Confirm-Wpf).
+    # Injeta a pasta de log atual no job -> o worker aplica antes de executar.
+    $enqueue = {
+        param([string] $Kind, $Data, [string] $Tab, [string] $Label)
+        if (-not $Data) { $Data = @{} }
+        $Data.LogDir = if ($txtLog.Text.Trim()) { $txtLog.Text.Trim() } else { $Script:DefaultLogDir }
+        # Mantem o ledger da UI apontando para o MESMO installer-state.json que o worker
+        # vai gravar (Data.LogDir). Assim o repaint pos-job (Set-WpfStatusPanel /
+        # Get-InstalledStateMap) le o arquivo correto, inclusive se o usuario mudou a pasta.
+        try { Set-LogDirectory -Path $Data.LogDir } catch { }
+        $jobQueue.Enqueue(@{ Kind = $Kind; Data = $Data; Tab = $Tab; Label = $Label })
+        $n = $jobQueue.Count
+        $lblQueueFoot.Text = "Na fila: $n"
+    }.GetNewClosure()
+
+    # Repinta a aba afetada por um job (roda SEMPRE na thread da UI).
+    $repaintTab = {
+        param([string] $Tab)
+        Set-WpfStatusPanel $spStatus $lblReboot
+        switch ($Tab) {
+            'Features'  { Add-WpfFeatureItems $spFeatures $win }
+            'Softwares' { Add-WpfSoftwareItems $spSoftware (& $softFilter) $win }
+            'IIS'       { Add-WpfIisItems $spIis $win }
+            'Sistema'   { Add-WpfSystemItems $spSystem $win }
+        }
+    }.GetNewClosure()
+
+    # DispatcherTimer: drena LiveLog -> painel e UiSignals -> repintura. Roda na
+    # thread do Dispatcher (UI), entao mexer em controles WPF aqui e seguro.
+    $Script:DrainBusy = $false
+    $logTimer = New-Object System.Windows.Threading.DispatcherTimer
+    $logTimer.Interval = [TimeSpan]::FromMilliseconds(200)
+    $logTimer.Add_Tick({
+        if ($Script:DrainBusy) { return }
+        $Script:DrainBusy = $true
+        try {
+            # (a) log ao vivo: snapshot + clear sob lock (nao perde linhas)
+            if ($Script:LiveLog.Count -gt 0) {
+                $chunk = $null
+                [System.Threading.Monitor]::Enter($Script:LiveLog.SyncRoot)
+                try { $chunk = @($Script:LiveLog.ToArray()); $Script:LiveLog.Clear() }
+                finally { [System.Threading.Monitor]::Exit($Script:LiveLog.SyncRoot) }
+                if ($chunk -and $chunk.Count) {
+                    $txtLive.AppendText(($chunk -join "`r`n") + "`r`n")
+                    if ($txtLive.Text.Length -gt 200000) { $txtLive.Text = $txtLive.Text.Substring($txtLive.Text.Length - 120000) }
+                    $txtLive.ScrollToEnd()
+                }
+            }
+            # (b) sinais do worker
+            while ($uiSignals.Count -gt 0) {
+                $s = $null
+                [System.Threading.Monitor]::Enter($uiSignals.SyncRoot)
+                try { if ($uiSignals.Count -gt 0) { $s = $uiSignals.Dequeue() } }
+                finally { [System.Threading.Monitor]::Exit($uiSignals.SyncRoot) }
+                if (-not $s) { break }
+                if ($s.Type -eq 'JobStart') { $Script:CurrentJobLabel = $s.Label }
+                elseif ($s.Type -eq 'JobDone') {
+                    $Script:CurrentJobLabel = $null
+                    & $repaintTab $s.Tab
+                }
+            }
+            # (c) indicador de fila
+            $n = $jobQueue.Count
+            $cur = $Script:CurrentJobLabel
+            $txt = if ($cur) { "Executando: $cur   |   Na fila: $n" }
+                   elseif ($n -gt 0) { "Na fila: $n" } else { 'Ocioso.' }
+            $lblQueue.Text = $txt
+            $lblQueueFoot.Text = $txt
+        } finally { $Script:DrainBusy = $false }
+    }.GetNewClosure())
+    $logTimer.Start()
+    if (-not $Script:UseWorker) {
+        $txtLive.AppendText("[modo sincrono] worker indisponivel - a janela pode congelar durante operacoes longas.`r`n")
+    }
+
+    $btnLogClear.Add_Click({ $txtLive.Clear() })
+    $btnCancelQueue.Add_Click({
+        [System.Threading.Monitor]::Enter($jobQueue.SyncRoot)
+        try { $jobQueue.Clear() } finally { [System.Threading.Monitor]::Exit($jobQueue.SyncRoot) }
+        $txtLive.AppendText("[fila] pendentes descartados (o job atual continua ate terminar).`r`n")
+    }.GetNewClosure())
 
     # --- Status ---
     $btnRefresh.Add_Click({ Set-WpfStatusPanel $spStatus $lblReboot })
@@ -2826,22 +3106,15 @@ function Show-InstallerWpf {
         if ($ids.Count -eq 0) { $lblFeat.Text = 'Nada selecionado.'; return }
         $names = @($ids | ForEach-Object { $id = $_; ($Script:CapabilityCatalog | Where-Object { $_.Id -eq $id } | Select-Object -First 1).Display })
         if (-not (Confirm-Wpf "Aplicar estas $($ids.Count) feature(s)?`n$(Format-ConfirmList $names)")) { return }
-        try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog
-            Invoke-CapabilityInstall -Ids $ids; $lblFeat.Text = Get-SummaryText
-        } catch { $lblFeat.Text = "Erro: $($_.Exception.Message)" }
-        finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot; Add-WpfFeatureItems $spFeatures $win }
-    })
-    $btnSsh.Add_Click({
-        if (-not (Confirm-Wpf 'Instalar o OpenSSH Server (servico sshd em Automatico + firewall na porta 22)?')) { return }
-        try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog; Reset-FeatureSession; Install-OpenSSHServer; Show-FeaturesSummary; $lblFeat.Text = Get-SummaryText }
-        catch { $lblFeat.Text = "Erro: $($_.Exception.Message)" }
-        finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot; Add-WpfFeatureItems $spFeatures $win }
-    })
-    $btnWsl.Add_Click({
-        if (-not (Confirm-Wpf 'Rodar "wsl --update" agora?')) { return }
-        try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog; Reset-FeatureSession; Update-Wsl; Show-FeaturesSummary; $lblFeat.Text = Get-SummaryText }
-        catch { $lblFeat.Text = "Erro: $($_.Exception.Message)" }
-        finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot; Add-WpfFeatureItems $spFeatures $win }
+        if ($Script:UseWorker) {
+            & $enqueue 'features' @{ Ids = $ids } 'Features' "Features ($($ids.Count))"
+            $lblFeat.Text = "Enfileirado (fila: $($jobQueue.Count)). Veja 'Log ao vivo'."
+        } else {
+            try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog
+                Invoke-CapabilityInstall -Ids $ids; $lblFeat.Text = Get-SummaryText
+            } catch { $lblFeat.Text = "Erro: $($_.Exception.Message)" }
+            finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot; Add-WpfFeatureItems $spFeatures $win }
+        }
     })
 
     # --- Softwares ---
@@ -2861,9 +3134,14 @@ function Show-InstallerWpf {
     })
     $btnChocoUpg.Add_Click({
         if (-not (Confirm-Wpf 'Executar "choco upgrade all"? Pode demorar.')) { return }
-        try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog; Update-AllChoco; $lblSoft.Text = 'choco upgrade all executado (ver log/console).' }
-        catch { $lblSoft.Text = "Erro: $($_.Exception.Message)" }
-        finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false }
+        if ($Script:UseWorker) {
+            & $enqueue 'updchoco' @{} 'Softwares' 'choco upgrade all'
+            $lblSoft.Text = "Enfileirado (fila: $($jobQueue.Count)). Veja 'Log ao vivo'."
+        } else {
+            try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog; Update-AllChoco; $lblSoft.Text = 'choco upgrade all executado (ver log/console).' }
+            catch { $lblSoft.Text = "Erro: $($_.Exception.Message)" }
+            finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false }
+        }
     })
     $btnSoftApply.Add_Click({
         $keys = @(Get-WpfCheckedTags $spSoftware)
@@ -2871,15 +3149,20 @@ function Show-InstallerWpf {
         $names = @($keys | ForEach-Object { $k = $_; ($Script:SoftwareCatalog | Where-Object { $_.Key -eq $k } | Select-Object -First 1).Name })
         if (-not (Confirm-Wpf "Instalar estes $($keys.Count) software(s)?`n$(Format-ConfirmList $names)")) { return }
         $pref = if ($rbChoco.IsChecked) { 'choco' } elseif ($rbAuto.IsChecked) { 'auto' } else { 'winget' }
-        try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog
-            Reset-FeatureSession
-            foreach ($k in $keys) {
-                $pkg = $Script:SoftwareCatalog | Where-Object { $_.Key -eq $k }
-                if ($pkg) { Install-SoftwarePackage -Pkg $pkg -Preferred $pref }
-            }
-            Show-FeaturesSummary; $lblSoft.Text = Get-SummaryText
-        } catch { $lblSoft.Text = "Erro: $($_.Exception.Message)" }
-        finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot; Add-WpfSoftwareItems $spSoftware (& $softFilter) $win }
+        if ($Script:UseWorker) {
+            & $enqueue 'software' @{ Keys = $keys; Pref = $pref } 'Softwares' "Softwares ($($keys.Count))"
+            $lblSoft.Text = "Enfileirado (fila: $($jobQueue.Count)). Veja 'Log ao vivo'."
+        } else {
+            try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog
+                Reset-FeatureSession
+                foreach ($k in $keys) {
+                    $pkg = $Script:SoftwareCatalog | Where-Object { $_.Key -eq $k }
+                    if ($pkg) { Install-SoftwarePackage -Pkg $pkg -Preferred $pref }
+                }
+                Show-FeaturesSummary; $lblSoft.Text = Get-SummaryText
+            } catch { $lblSoft.Text = "Erro: $($_.Exception.Message)" }
+            finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot; Add-WpfSoftwareItems $spSoftware (& $softFilter) $win }
+        }
     })
 
     # --- IIS ---
@@ -2893,45 +3176,70 @@ function Show-InstallerWpf {
         if ($feats.Count -eq 0 -and -not $doAspnet -and -not $doReset) { $lblIis.Text = 'Nada selecionado.'; return }
         $lst = @($feats); if ($doAspnet) { $lst += 'aspnet_state = Automatico' }; if ($doReset) { $lst += 'iisreset' }
         if (-not (Confirm-Wpf "Aplicar no IIS ($($lst.Count) item(ns))?`n$(Format-ConfirmList $lst)")) { return }
-        try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog
-            Reset-FeatureSession
-            foreach ($f in $feats) { Enable-OptionalFeatureSafe -FeatureName $f -All }   # ordem = $IISFeatures
-            if ($doAspnet) { Set-AspNetStateAuto }
-            if ($doReset)  { Invoke-IISReset }
-            Show-FeaturesSummary; $lblIis.Text = Get-SummaryText
-        } catch { $lblIis.Text = "Erro: $($_.Exception.Message)" }
-        finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot; Add-WpfIisItems $spIis $win }
+        if ($Script:UseWorker) {
+            & $enqueue 'iis' @{ Feats = $feats; Aspnet = $doAspnet; Reset = $doReset } 'IIS' "IIS ($($lst.Count))"
+            $lblIis.Text = "Enfileirado (fila: $($jobQueue.Count)). Veja 'Log ao vivo'."
+        } else {
+            try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog
+                Reset-FeatureSession
+                foreach ($f in $feats) { Enable-OptionalFeatureSafe -FeatureName $f -All }   # ordem = $IISFeatures
+                if ($doAspnet) { Set-AspNetStateAuto }
+                if ($doReset)  { Invoke-IISReset }
+                Show-FeaturesSummary; $lblIis.Text = Get-SummaryText
+            } catch { $lblIis.Text = "Erro: $($_.Exception.Message)" }
+            finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot; Add-WpfIisItems $spIis $win }
+        }
     })
     $btnIisFull.Add_Click({
         if (-not (Confirm-Wpf "Instalar IIS COMPLETO ($($Script:IISFeatures.Count) features) + aspnet_state + iisreset? Pode demorar.")) { return }
-        try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog; Reset-FeatureSession; Install-IISFull; Show-FeaturesSummary; $lblIis.Text = Get-SummaryText }
-        catch { $lblIis.Text = "Erro: $($_.Exception.Message)" }
-        finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot; Add-WpfIisItems $spIis $win }
+        if ($Script:UseWorker) {
+            & $enqueue 'iisfull' @{} 'IIS' 'IIS COMPLETO'
+            $lblIis.Text = "Enfileirado (fila: $($jobQueue.Count)). Veja 'Log ao vivo'."
+        } else {
+            try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog; Reset-FeatureSession; Install-IISFull; Show-FeaturesSummary; $lblIis.Text = Get-SummaryText }
+            catch { $lblIis.Text = "Erro: $($_.Exception.Message)" }
+            finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot; Add-WpfIisItems $spIis $win }
+        }
     })
     $btnAspNet.Add_Click({
         if (-not (Confirm-Wpf 'Definir o servico aspnet_state como Automatico?')) { return }
-        try { & $setBusy $true; & $applyLog; Set-AspNetStateAuto; $lblIis.Text = 'aspnet_state configurado (ver log).' }
-        catch { $lblIis.Text = "Erro: $($_.Exception.Message)" } finally { & $setBusy $false }
+        if ($Script:UseWorker) {
+            & $enqueue 'aspnet' @{} 'IIS' 'aspnet_state=Auto'
+            $lblIis.Text = "Enfileirado (fila: $($jobQueue.Count)). Veja 'Log ao vivo'."
+        } else {
+            try { & $setBusy $true; & $applyLog; Set-AspNetStateAuto; $lblIis.Text = 'aspnet_state configurado (ver log).' }
+            catch { $lblIis.Text = "Erro: $($_.Exception.Message)" } finally { & $setBusy $false }
+        }
     })
     $btnIisReset.Add_Click({
         if (-not (Confirm-Wpf 'Executar iisreset agora?')) { return }
-        try { & $setBusy $true; & $applyLog; Invoke-IISReset; $lblIis.Text = 'iisreset executado (ver log).' }
-        catch { $lblIis.Text = "Erro: $($_.Exception.Message)" } finally { & $setBusy $false }
+        if ($Script:UseWorker) {
+            & $enqueue 'iisreset' @{} 'IIS' 'iisreset'
+            $lblIis.Text = "Enfileirado (fila: $($jobQueue.Count)). Veja 'Log ao vivo'."
+        } else {
+            try { & $setBusy $true; & $applyLog; Invoke-IISReset; $lblIis.Text = 'iisreset executado (ver log).' }
+            catch { $lblIis.Text = "Erro: $($_.Exception.Message)" } finally { & $setBusy $false }
+        }
     })
 
     # --- Rede: NAT ---
     $btnNat.Add_Click({
         if (-not (Confirm-Wpf "Criar/atualizar o NAT Switch '$($natName.Text.Trim())' ($($natSubnet.Text.Trim()))?")) { return }
-        try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog
-            Reset-FeatureSession
-            if ($natNetName.Text.Trim()) {
-                New-NatSwitch -SwitchName $natName.Text.Trim() -Subnet $natSubnet.Text.Trim() -GatewayIP $natGw.Text.Trim() -NatName $natNetName.Text.Trim()
-            } else {
-                New-NatSwitch -SwitchName $natName.Text.Trim() -Subnet $natSubnet.Text.Trim() -GatewayIP $natGw.Text.Trim()
-            }
-            $lblNet.Text = Get-SummaryText
-        } catch { $lblNet.Text = "Erro: $($_.Exception.Message)" }
-        finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot }
+        if ($Script:UseWorker) {
+            & $enqueue 'nat' @{ SwitchName = $natName.Text.Trim(); Subnet = $natSubnet.Text.Trim(); GatewayIP = $natGw.Text.Trim(); NatName = $natNetName.Text.Trim() } '' "NAT Switch '$($natName.Text.Trim())'"
+            $lblNet.Text = "Enfileirado (fila: $($jobQueue.Count)). Veja 'Log ao vivo'."
+        } else {
+            try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog
+                Reset-FeatureSession
+                if ($natNetName.Text.Trim()) {
+                    New-NatSwitch -SwitchName $natName.Text.Trim() -Subnet $natSubnet.Text.Trim() -GatewayIP $natGw.Text.Trim() -NatName $natNetName.Text.Trim()
+                } else {
+                    New-NatSwitch -SwitchName $natName.Text.Trim() -Subnet $natSubnet.Text.Trim() -GatewayIP $natGw.Text.Trim()
+                }
+                $lblNet.Text = Get-SummaryText
+            } catch { $lblNet.Text = "Erro: $($_.Exception.Message)" }
+            finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot }
+        }
     })
 
     # --- Rede: DHCP ---
@@ -2959,23 +3267,31 @@ function Show-InstallerWpf {
     })
     $btnDhcp.Add_Click({
         if (-not (Confirm-Wpf "Instalar/configurar o DHCP para o NAT ($($dhScope.Text.Trim()))?")) { return }
-        try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog
-            Reset-FeatureSession
-            if (-not (Install-DhcpRoleForNat)) { $lblNet.Text = (Get-SummaryText) + "`nSe foi pedido reinicio: reinicie e rode de novo."; return }
-            $iface = $ui.Iface
-            if (-not $iface) {
+        # Descoberta da interface fica na UI (precisa do estado de $ui / catalogo de rede).
+        $iface = $ui.Iface
+        if (-not $iface) {
+            try {
                 $m = Get-NatNetworkInfo | Where-Object { $_.ScopeId -eq $dhScope.Text.Trim() } | Select-Object -First 1
                 if ($m) { $iface = $m.InterfaceAlias }
-            }
-            if (-not $iface) { $lblNet.Text = 'Clique "Detectar rede NAT" antes de aplicar o DHCP.'; return }
-            $lease = 7300; $tmp = 0
-            if ([int]::TryParse($dhLease.Text.Trim(), [ref]$tmp) -and $tmp -gt 0) { $lease = $tmp }
-            Set-NatDhcpScope -ScopeId $dhScope.Text.Trim() -Mask $dhMask.Text.Trim() `
-                -RangeFrom $dhFrom.Text.Trim() -RangeTo $dhTo.Text.Trim() `
-                -Gateway $dhGw.Text.Trim() -Dns $dhDns.Text.Trim() -NatIface $iface -LeaseDays $lease
-            $lblNet.Text = Get-SummaryText
-        } catch { $lblNet.Text = "Erro: $($_.Exception.Message)" }
-        finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot }
+            } catch { }
+        }
+        if (-not $iface) { $lblNet.Text = 'Clique "Detectar rede NAT" antes de aplicar o DHCP.'; return }
+        $lease = 7300; $tmp = 0
+        if ([int]::TryParse($dhLease.Text.Trim(), [ref]$tmp) -and $tmp -gt 0) { $lease = $tmp }
+        if ($Script:UseWorker) {
+            & $enqueue 'dhcp' @{ ScopeId = $dhScope.Text.Trim(); Mask = $dhMask.Text.Trim(); RangeFrom = $dhFrom.Text.Trim(); RangeTo = $dhTo.Text.Trim(); Gateway = $dhGw.Text.Trim(); Dns = $dhDns.Text.Trim(); Iface = $iface; LeaseDays = $lease } '' "DHCP NAT ($($dhScope.Text.Trim()))"
+            $lblNet.Text = "Enfileirado (fila: $($jobQueue.Count)). Veja 'Log ao vivo'."
+        } else {
+            try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog
+                Reset-FeatureSession
+                if (-not (Install-DhcpRoleForNat)) { $lblNet.Text = (Get-SummaryText) + "`nSe foi pedido reinicio: reinicie e rode de novo."; return }
+                Set-NatDhcpScope -ScopeId $dhScope.Text.Trim() -Mask $dhMask.Text.Trim() `
+                    -RangeFrom $dhFrom.Text.Trim() -RangeTo $dhTo.Text.Trim() `
+                    -Gateway $dhGw.Text.Trim() -Dns $dhDns.Text.Trim() -NatIface $iface -LeaseDays $lease
+                $lblNet.Text = Get-SummaryText
+            } catch { $lblNet.Text = "Erro: $($_.Exception.Message)" }
+            finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot }
+        }
     })
 
     # --- Sistema (Customizacoes + Config base unificadas) ---
@@ -2987,6 +3303,11 @@ function Show-InstallerWpf {
         $tags = @(Get-WpfCheckedTags $spSystem)
         if ($tags.Count -eq 0) { $lblSys.Text = 'Nada selecionado.'; return }
         if (-not (Confirm-Wpf "Aplicar os $($tags.Count) item(ns) marcado(s)?")) { return }
+        if ($Script:UseWorker) {
+            & $enqueue 'system' @{ Tags = $tags } 'Sistema' "Sistema ($($tags.Count))"
+            $lblSys.Text = "Enfileirado (fila: $($jobQueue.Count)). Veja 'Log ao vivo'."
+            return
+        }
         try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog
             Reset-FeatureSession
             $restartExplorer = $false
@@ -3020,16 +3341,38 @@ function Show-InstallerWpf {
     })
     $btnUpdWinget.Add_Click({
         if (-not (Confirm-Wpf 'Atualizar TUDO que o winget tem pendente? Pode demorar.')) { return }
-        try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog; Update-AllWinget; $lblUpd.Text = 'winget upgrade --all executado (ver log/console).' }
-        catch { $lblUpd.Text = "Erro: $($_.Exception.Message)" }
-        finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false }
+        if ($Script:UseWorker) {
+            & $enqueue 'updwinget' @{} '' 'winget upgrade --all'
+            $lblUpd.Text = "Enfileirado (fila: $($jobQueue.Count)). Veja 'Log ao vivo'."
+        } else {
+            try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog; Update-AllWinget; $lblUpd.Text = 'winget upgrade --all executado (ver log/console).' }
+            catch { $lblUpd.Text = "Erro: $($_.Exception.Message)" }
+            finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false }
+        }
     })
     $btnUpdChoco.Add_Click({
         if (-not (Confirm-Wpf 'Atualizar TUDO que o choco tem pendente? Pode demorar.')) { return }
-        try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog; Update-AllChoco; $lblUpd.Text = 'choco upgrade all executado (ver log/console).' }
-        catch { $lblUpd.Text = "Erro: $($_.Exception.Message)" }
-        finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false }
+        if ($Script:UseWorker) {
+            & $enqueue 'updchoco' @{} '' 'choco upgrade all'
+            $lblUpd.Text = "Enfileirado (fila: $($jobQueue.Count)). Veja 'Log ao vivo'."
+        } else {
+            try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog; Update-AllChoco; $lblUpd.Text = 'choco upgrade all executado (ver log/console).' }
+            catch { $lblUpd.Text = "Erro: $($_.Exception.Message)" }
+            finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false }
+        }
     })
+
+    $win.Add_Closing({
+        if (($jobQueue.Count -gt 0 -or $Script:CurrentJobLabel) -and
+            -not (Confirm-Wpf 'Ha instalacao em andamento ou na fila. Fechar pode interromper. Sair?')) {
+            $_.Cancel = $true; return
+        }
+        try { $logTimer.Stop() } catch { }
+        $ctrl['Stop'] = $true
+        try { if ($worker) { $worker.Ps.Stop(); $worker.Rs.Close(); $worker.Rs.Dispose() } } catch { }
+        try { Remove-Item Env:\WINCFG_NOUI -ErrorAction SilentlyContinue } catch { }
+        $Script:LiveLog = $null
+    }.GetNewClosure())
 
     $null = $win.ShowDialog()
 }
@@ -3050,6 +3393,6 @@ function Start-Gui {
 #  Sob o launcher (irm | iex) ja estamos Admin + STA. Abre a janela WPF
 #  (Start-Gui); sem WPF (Server Core/headless) cai para o menu de console.
 # ============================================================================
-Start-Gui
+if (-not $env:WINCFG_NOUI) { Start-Gui }   # worker seta WINCFG_NOUI p/ carregar so as funcoes
 # ===== FIM bootstrap-tail.ps1 =====
 

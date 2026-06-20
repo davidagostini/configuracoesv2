@@ -2,7 +2,7 @@
 # ============================================================================
 #  LAUNCHER  -  ponto de entrada do 'irm | iex'
 #  GERADO por build.ps1 a partir deste template. NAO editar o dist a mao.
-#  Placeholders https://raw.githubusercontent.com/davidagostini/configuracoesv2/main/dist/bootstrap.ps1 / https://raw.githubusercontent.com/davidagostini/configuracoesv2/main/dist/payload.ps1 / 327A3D3AA27B15B3D4910082572764E81B20BFB2A7C7F8CA3FB94D69820EB016 sao
+#  Placeholders https://raw.githubusercontent.com/davidagostini/configuracoesv2/main/dist/bootstrap.ps1 / https://raw.githubusercontent.com/davidagostini/configuracoesv2/main/dist/payload.ps1 / 7A44BBE26CF11A180E40DA5B434187B72A9B88CFD12918E43549869080F03A18 sao
 #  substituidos no build (URLs pinadas no commit SHA).
 # ============================================================================
 $ErrorActionPreference = 'Stop'
@@ -10,7 +10,7 @@ $ErrorActionPreference = 'Stop'
 
 $SelfUrl    = 'https://raw.githubusercontent.com/davidagostini/configuracoesv2/main/dist/bootstrap.ps1'        # este launcher (re-spawn elevado)
 $PayloadUrl = 'https://raw.githubusercontent.com/davidagostini/configuracoesv2/main/dist/payload.ps1'     # payload (modulos + UI)
-$PayloadSha = '327A3D3AA27B15B3D4910082572764E81B20BFB2A7C7F8CA3FB94D69820EB016'  # SHA256 esperado do payload
+$PayloadSha = '7A44BBE26CF11A180E40DA5B434187B72A9B88CFD12918E43549869080F03A18'  # SHA256 esperado do payload
 
 # --- PASSO 1: re-spawn unico = Admin + STA + Bypass -------------------------
 # Sentinela $env:WINCFG_RELAUNCHED curto-circuita as checagens no filho (anti-loop UAC).
@@ -58,4 +58,5 @@ if ($PayloadSha -notmatch '^_' -and $hash -ne $PayloadSha) {
 # ==== FIM TEMPORARIO
 
 $payload = [System.Text.Encoding]::UTF8.GetString($bytes).TrimStart([char]0xFEFF)
+$global:WINCFG_PAYLOAD_SRC = $payload   # fonte p/ o worker runspace reexecutar (modo irm)
 Invoke-Expression $payload

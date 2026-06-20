@@ -64,8 +64,10 @@ Em `C:\davidagostini\instalador\`:
 1. **Reativar a validacao SHA256** do launcher e **pinar numa tag** (publicacao
    imutavel). Hoje o `bootstrap-head.ps1` esta em **bypass TEMPORARIO** (so avisa),
    entre marcadores `==== TEMPORARIO`. Passos em `CLAUDE.md` (secao Distribuicao).
-2. **Async na GUI**: hoje a execucao e sincrona e a janela congela em operacoes
-   longas (IIS completo, softwares grandes). Reescrever com runspace + log ao vivo.
+2. **(FEITO) Async na GUI**: worker em runspace + **fila serial** (varios "Aplicar"
+   enfileiram) + aba **"Log ao vivo"** (DispatcherTimer drena o log do worker) +
+   **fallback sincrono**. O bootstrap-head expoe a fonte (`$global:WINCFG_PAYLOAD_SRC`)
+   e o tail pula o Start-Gui no worker (`$env:WINCFG_NOUI`).
 3. **SQL Server (choco, Developer)**: a escolha esta certa; se o `ExitCode -1`
    voltar, investigar pre-requisitos do pacote (o detalhe agora vai pro log).
 4. (Opcional) Abas separadas em Features; tamanhos extras do icone.

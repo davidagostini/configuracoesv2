@@ -108,7 +108,7 @@ function Install-OpenSSHServer {
 # --- WSL (atualizacao do kernel/componentes) -------------------------------
 # Roda 'wsl --update'. Nao instala distro; so atualiza o WSL ja presente no SO.
 function Update-Wsl {
-    $name = 'WSL (update)'
+    $name = 'WSL'
     Write-Log "Atualizando o WSL (wsl --update)..." -Level STEP
     if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) {
         Write-Log "wsl.exe nao encontrado neste SO." -Level WARN

@@ -82,8 +82,9 @@ Módulos (em `modules/`):
   sem WPF (Server Core/headless/não-STA). Janela fica aberta (sessão iterativa); **cada "Aplicar"
   pede confirmação listando os itens** e desabilita os botões durante a execução; **a lista é
   repopulada após aplicar** (limpa seleção) e marca itens já instalados com **"[instalado]"** (verde),
-  lendo o ledger (`Get-InstalledStateMap`). Execução é **síncrona** (congela em operações longas;
-  async é pendência).
+  lendo o ledger (`Get-InstalledStateMap`). Execução é **assíncrona**: cada "Aplicar" enfileira num
+  **worker em runspace** (fila serial) e a aba **"Log ao vivo"** mostra o andamento; há **fallback
+  síncrono** se o worker não subir.
 
 ## Convenções e invariantes (NÃO quebrar)
 
@@ -99,9 +100,11 @@ Módulos (em `modules/`):
   ação deve registrar via `Add-FeatureResult` — que também grava no **ledger persistente**
   (`installer-state.json`), lido pela aba "Status" para retomada após reboot. Idempotência
   continua sendo o mecanismo real de "continuar de onde parou" (rodar de novo pula o que já está feito).
-- **GUI: confirmação por ação.** Toda aplicação na janela WPF pede confirmação (Sim/Não) e
-  desabilita os botões durante a execução. A execução é **síncrona** (a janela congela em
-  operações longas; o log ao vivo sai no console). Isso evita disparo acidental por clique enfileirado.
+- **GUI: confirmação por ação + fila assíncrona.** Toda aplicação na janela WPF pede confirmação
+  (Sim/Não) e então **enfileira** o trabalho num **worker em runspace** (fila serial) — a janela
+  **não congela**; a aba **"Log ao vivo"** mostra o andamento e a fila. **Fallback síncrono** se o
+  worker não iniciar. Os controles só são tocados pela thread do `Dispatcher` (um DispatcherTimer
+  drena o log/sinais do worker).
 - **Idempotência.** Operações checam estado antes de agir (`Set-RegistryValue`, `Get-WindowsFeature`,
   `Get-WindowsOptionalFeature` etc.) e não repetem trabalho.
 - **Dispatch por capacidade, não por nome de SO.** Para escolher a API de feature, cheque a

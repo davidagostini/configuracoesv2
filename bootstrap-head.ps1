@@ -58,4 +58,5 @@ if ($PayloadSha -notmatch '^_' -and $hash -ne $PayloadSha) {
 # ==== FIM TEMPORARIO
 
 $payload = [System.Text.Encoding]::UTF8.GetString($bytes).TrimStart([char]0xFEFF)
+$global:WINCFG_PAYLOAD_SRC = $payload   # fonte p/ o worker runspace reexecutar (modo irm)
 Invoke-Expression $payload

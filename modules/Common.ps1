@@ -23,6 +23,11 @@ if ($PSScriptRoot) {
 # mostrar o que ja rodou / o que precisa de reinicio / o que ficou deferido.
 $Script:StateFile = Join-Path (Split-Path $Script:LogFile -Parent) 'installer-state.json'
 
+# Sink opcional de log ao vivo: quando a GUI (ou o worker) cria esta colecao
+# sincronizada, Write-Log empurra cada linha aqui alem do arquivo/console. Um
+# DispatcherTimer na UI drena para o painel. Mesma referencia nos dois runspaces.
+$Script:LiveLog = $null
+
 # Define a pasta onde os logs serao gravados (campo "Pasta de log" da tela).
 # Gera um arquivo por execucao com timestamp passado pelo chamador, ou o
 # install.log padrao quando -FileName nao e informado.
@@ -69,6 +74,8 @@ function Write-Log {
         default { '  -    ' }
     }
     Write-Host "$prefix$Message" -ForegroundColor $color
+
+    if ($null -ne $Script:LiveLog) { try { [void]$Script:LiveLog.Add($line) } catch { } }
 }
 
 # --- Verificacao de privilegios -------------------------------------------

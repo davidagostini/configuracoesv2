@@ -54,9 +54,10 @@ entre sessões.
   por baixo (`Common.ps1`).
 - **Janela aberta / iterativa**: cada aba tem seu "Aplicar"; a janela não fecha entre ações.
 - **Confirmação por ação**: todo "Aplicar" pede Sim/Não **listando os itens** que vão rodar, e os
-  botões são desabilitados durante a execução. Motivo: a execução é **síncrona** (a janela congela em
-  operações longas, com o log no console); sem isso, um clique enfileirado disparava ação por engano
-  (chegou a iniciar o IIS sozinho) e seleção antiga reentrava. **Pendente:** execução assíncrona (runspace).
+  evita disparo acidental. A execução é **assíncrona**: o "Aplicar" **enfileira** num **worker em
+  runspace** (fila serial) e a aba **"Log ao vivo"** mostra o andamento — a janela não congela.
+  **Fallback síncrono** se o worker não iniciar. Os controles WPF só são tocados pela thread do
+  `Dispatcher` (um DispatcherTimer drena o log e os sinais do worker).
 - **Ícone próprio**: a janela usa um avatar desenhado em runtime (`New-AppIconImage`, GDI+ →
   BitmapSource) no lugar do ícone do PowerShell. PNG/ICO de referência em `docs/app-icon.*`.
 - **Detalhe de erro**: falha de choco/winget grava o trecho final da saída no log + resumo curto no

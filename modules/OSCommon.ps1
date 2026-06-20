@@ -58,13 +58,17 @@ function New-Capability {
     param(
         $Id, $Display, $Category, $AvailableOn = 'Both',
         $Features = @(), $ServerRole = '',
-        [switch] $IncludeManagementTools, [switch] $NeedsSource, $Notes = ''
+        [switch] $IncludeManagementTools, [switch] $NeedsSource, $Notes = '',
+        # InstallFn: nome de uma funcao que faz a instalacao por conta propria
+        # (ex.: OpenSSH via Add-WindowsCapability, WSL via 'wsl --update'). Quando
+        # presente, o dispatch chama essa funcao em vez do caminho DISM/ServerRole.
+        $InstallFn = ''
     )
     [PSCustomObject]@{
         Id          = $Id; Display = $Display; Category = $Category
         AvailableOn = $AvailableOn; Features = @($Features); ServerRole = $ServerRole
         IncludeManagementTools = [bool]$IncludeManagementTools
-        NeedsSource = [bool]$NeedsSource; Notes = $Notes
+        NeedsSource = [bool]$NeedsSource; Notes = $Notes; InstallFn = $InstallFn
     }
 }
 
@@ -72,7 +76,9 @@ $Script:CapabilityCatalog = @(
     (New-Capability 'HyperV'        'Hyper-V'                         'Virtualizacao' 'Both'       @('Microsoft-Hyper-V-All') 'Hyper-V' -IncludeManagementTools -Notes 'Requer reinicio')
     (New-Capability 'Containers'    'Containers'                     'Virtualizacao' 'Both'       @('Containers') 'Containers')
     (New-Capability 'Sandbox'       'Windows Sandbox'                'Virtualizacao' 'ClientOnly' @('Containers-DisposableClientVM'))
+    (New-Capability 'WSL'           'WSL'                            'Virtualizacao' 'Both'       @() '' -Notes 'wsl --update' -InstallFn 'Update-Wsl')
     (New-Capability 'Telnet'        'Telnet Client'                  'Rede'          'Both'       @('TelnetClient'))
+    (New-Capability 'OpenSSH'       'OpenSSH Server'                 'Rede'          'Both'       @() '' -Notes 'sshd + firewall 22' -InstallFn 'Install-OpenSSHServer')
     (New-Capability 'IISCore'       'IIS - Servidor Web'             'Web/IIS'       'Both'       @('IIS-WebServerRole','IIS-WebServer'))
     (New-Capability 'IISAspNet'     'IIS - ASP.NET 4.x'              'Web/IIS'       'Both'       @('IIS-ASPNET45'))
     (New-Capability 'IISMgmt'       'IIS - Console de Gerenciamento' 'Web/IIS'       'Both'       @('IIS-ManagementConsole','IIS-ManagementScriptingTools','IIS-ManagementService'))
@@ -101,6 +107,14 @@ function Install-Capability {
         [string] $Source   # midia opcional p/ NetFx3 (FoD)
     )
     $role = Get-OSRole
+
+    # Acao custom: a capability aponta uma funcao que instala por conta propria
+    # (OpenSSH via Add-WindowsCapability, WSL via 'wsl --update'). Ela ja registra
+    # o resultado via Add-FeatureResult.
+    if ($Capability.InstallFn) {
+        & $Capability.InstallFn
+        return
+    }
 
     # Bifurcacao: role de Server quando ha ServerManager (Hyper-V, Containers).
     if ($Capability.ServerRole -and $role.HasServerManager) {
