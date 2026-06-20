@@ -88,10 +88,11 @@ Módulos (em `modules/`):
 
 ## Convenções e invariantes (NÃO quebrar)
 
-- **Nunca reiniciar automaticamente.** `Enable-WindowsOptionalFeature` usa `-NoRestart`;
-  `Install-WindowsFeature` (ServerManager) **não tem** `-NoRestart` e por padrão já não reinicia
-  (nunca passar `-Restart`). Em ambos detecta-se `RestartNeeded` e registra-se `PrecisaReinicio`
-  — o reinício é manual.
+- **Reinício avisado, nunca silencioso.** As features usam `-NoRestart` e o motor **nunca** passa
+  `-Restart` por conta própria; detecta-se `RestartNeeded` e registra-se `PrecisaReinicio`. **Exceção
+  pedida pelo usuário:** quando a fila esvazia e algum job pediu reinício, a GUI **avisa e oferece
+  reiniciar** com uma **contagem regressiva cancelável** (`Invoke-RebootOffer`; "Adiar" ou fechar a
+  janela cancela). Fora esse aviso explícito, nada reinicia sozinho.
 - **Deferir em reinício pendente.** Antes de instalar uma feature, `Test-CanInstallOrDefer`
   checa `Test-PendingReboot`; se houver reinício pendente, o item é **deferido** (não instalado)
   e registrado como `Deferido`. Isso evita falhas em cadeia.
@@ -108,9 +109,11 @@ Módulos (em `modules/`):
 - **Idempotência.** Operações checam estado antes de agir (`Set-RegistryValue`, `Get-WindowsFeature`,
   `Get-WindowsOptionalFeature` etc.) e não repetem trabalho.
 - **Dispatch por capacidade, não por nome de SO.** Para escolher a API de feature, cheque a
-  presença do módulo ServerManager (`(Get-OSRole).HasServerManager`), não o nome da edição. Só o
-  Hyper-V e Containers/Sandbox divergem de verdade entre client e server; as demais features usam
-  os mesmos ids DISM nos dois. Ver `docs/DESIGN-irm-gui.md`.
+  presença do módulo ServerManager (`(Get-OSRole).HasServerManager`), não o nome da edição. Hoje só
+  Containers diverge (Install-WindowsFeature no Server vs DISM no Client). O **Hyper-V usa DISM**
+  (`Microsoft-Hyper-V-All`) **nos dois SOs** de propósito: no Server o `Install-WindowsFeature` do
+  Hyper-V trava no Server Manager (*"plug-in taking more time to load"*). As demais usam os mesmos
+  ids DISM nos dois. Ver `docs/DESIGN-irm-gui.md`.
 
 ## Distribuição (implementada — v1.0.0 — ver docs/)
 

@@ -10,45 +10,17 @@
 # ============================================================================
 
 # --- Hyper-V (Role) - REQUER REINICIO --------------------------------------
-# OS-aware: no Windows 11 (sem ServerManager) usa Enable-WindowsOptionalFeature
-# com o feature 'Microsoft-Hyper-V-All'; no Windows Server usa Install-WindowsFeature.
+# Instala via DISM (Enable-WindowsOptionalFeature 'Microsoft-Hyper-V-All') TANTO
+# no Windows 11 quanto no Server. No Server EVITAMOS Install-WindowsFeature de
+# proposito: em alguns hosts ele trava no "Collecting data" repetindo
+# "The plug-in for Hyper-V is taking more time to load than expected" e nunca
+# conclui. O DISM nao passa pelo Server Manager (sem plug-in p/ carregar) e o
+# guarda-chuva 'Microsoft-Hyper-V-All -All' ja inclui o modulo PowerShell e o
+# Hyper-V Manager. Enable-OptionalFeatureSafe trata ja-instalado, defere em
+# reinicio pendente, usa -NoRestart e registra PrecisaReinicio.
 function Install-HyperVRole {
-    $name = 'Hyper-V'
-    Write-Log "Verificando a role Hyper-V..." -Level STEP
-
-    # Windows client (Win11 Pro/Ent/Edu): caminho DISM. Install-WindowsFeature nao existe aqui.
-    if (-not (Get-OSRole).HasServerManager) {
-        Write-Log "SO client detectado - usando Enable-WindowsOptionalFeature (Microsoft-Hyper-V-All)." -Level INFO
-        Enable-OptionalFeatureSafe -FeatureName 'Microsoft-Hyper-V-All' -DisplayName 'Hyper-V' -All
-        return
-    }
-
-    $state = Get-WindowsFeature -Name Hyper-V -ErrorAction SilentlyContinue
-    if ($state -and $state.Installed) {
-        Write-Log "Hyper-V ja esta instalado." -Level OK
-        Add-FeatureResult -Name $name -Status 'JaPresente'
-        return
-    }
-
-    if (-not (Test-CanInstallOrDefer -Name $name)) { return }
-
-    Write-Log "Instalando Hyper-V (com ferramentas de gerenciamento)..." -Level STEP
-    Start-FeatureTimer -Name $name
-    # Install-WindowsFeature NAO tem -NoRestart; por padrao ja nao reinicia (so com -Restart).
-    $result = Install-WindowsFeature -Name Hyper-V -IncludeManagementTools
-
-    if ($result.Success) {
-        if ($result.RestartNeeded -ne 'No') {
-            Write-Log "Hyper-V instalado - REINICIO necessario para concluir." -Level WARN
-            Add-FeatureResult -Name $name -Status 'PrecisaReinicio' -Detail 'Concluir instalacao do Hyper-V'
-        } else {
-            Write-Log "Hyper-V instalado." -Level OK
-            Add-FeatureResult -Name $name -Status 'Instalado'
-        }
-    } else {
-        Write-Log "Falha ao instalar o Hyper-V. ExitCode: $($result.ExitCode)" -Level ERRO
-        Add-FeatureResult -Name $name -Status 'Falha' -Detail "ExitCode $($result.ExitCode)"
-    }
+    Write-Log "Verificando/instalando a role Hyper-V (via DISM)..." -Level STEP
+    Enable-OptionalFeatureSafe -FeatureName 'Microsoft-Hyper-V-All' -DisplayName 'Hyper-V' -All
 }
 
 # --- Telnet Client ----------------------------------------------------------

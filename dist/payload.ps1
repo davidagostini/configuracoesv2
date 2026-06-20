@@ -448,9 +448,12 @@ function Get-OSRole {
 
 # ============================================================================
 #  Catalogo de capacidades + dispatch por capacidade (nao por nome de SO)
-#  Ver docs/DESIGN-irm-gui.md secao 3. Das ~10 capacidades, so HyperV e
-#  Containers BIFURCAM (Install-WindowsFeature no Server vs DISM no Client);
-#  as demais usam os mesmos ids DISM nos dois SOs. Sandbox e client-only.
+#  Ver docs/DESIGN-irm-gui.md secao 3. Hoje so Containers BIFURCA
+#  (Install-WindowsFeature no Server vs DISM no Client). O Hyper-V usa DISM
+#  ('Microsoft-Hyper-V-All') nos dois SOs de proposito: no Server o
+#  Install-WindowsFeature do Hyper-V trava no Server Manager ("plug-in taking
+#  more time to load"). As demais usam os mesmos ids DISM nos dois SOs.
+#  Sandbox e client-only.
 # ============================================================================
 
 # AvailableOn: 'Both' | 'ClientOnly' | 'ServerOnly'.
@@ -476,7 +479,7 @@ function New-Capability {
 }
 
 $Script:CapabilityCatalog = @(
-    (New-Capability 'HyperV'        'Hyper-V'                         'Virtualizacao' 'Both'       @('Microsoft-Hyper-V-All') 'Hyper-V' -IncludeManagementTools -Notes 'Requer reinicio')
+    (New-Capability 'HyperV'        'Hyper-V'                         'Virtualizacao' 'Both'       @('Microsoft-Hyper-V-All') '' -Notes 'Via DISM; requer reinicio')
     (New-Capability 'Containers'    'Containers'                     'Virtualizacao' 'Both'       @('Containers') 'Containers')
     (New-Capability 'Sandbox'       'Windows Sandbox'                'Virtualizacao' 'ClientOnly' @('Containers-DisposableClientVM'))
     (New-Capability 'WSL'           'WSL'                            'Virtualizacao' 'Both'       @() '' -Notes 'wsl --update' -InstallFn 'Update-Wsl')
@@ -697,45 +700,17 @@ function Invoke-AllCustomizations {
 # ============================================================================
 
 # --- Hyper-V (Role) - REQUER REINICIO --------------------------------------
-# OS-aware: no Windows 11 (sem ServerManager) usa Enable-WindowsOptionalFeature
-# com o feature 'Microsoft-Hyper-V-All'; no Windows Server usa Install-WindowsFeature.
+# Instala via DISM (Enable-WindowsOptionalFeature 'Microsoft-Hyper-V-All') TANTO
+# no Windows 11 quanto no Server. No Server EVITAMOS Install-WindowsFeature de
+# proposito: em alguns hosts ele trava no "Collecting data" repetindo
+# "The plug-in for Hyper-V is taking more time to load than expected" e nunca
+# conclui. O DISM nao passa pelo Server Manager (sem plug-in p/ carregar) e o
+# guarda-chuva 'Microsoft-Hyper-V-All -All' ja inclui o modulo PowerShell e o
+# Hyper-V Manager. Enable-OptionalFeatureSafe trata ja-instalado, defere em
+# reinicio pendente, usa -NoRestart e registra PrecisaReinicio.
 function Install-HyperVRole {
-    $name = 'Hyper-V'
-    Write-Log "Verificando a role Hyper-V..." -Level STEP
-
-    # Windows client (Win11 Pro/Ent/Edu): caminho DISM. Install-WindowsFeature nao existe aqui.
-    if (-not (Get-OSRole).HasServerManager) {
-        Write-Log "SO client detectado - usando Enable-WindowsOptionalFeature (Microsoft-Hyper-V-All)." -Level INFO
-        Enable-OptionalFeatureSafe -FeatureName 'Microsoft-Hyper-V-All' -DisplayName 'Hyper-V' -All
-        return
-    }
-
-    $state = Get-WindowsFeature -Name Hyper-V -ErrorAction SilentlyContinue
-    if ($state -and $state.Installed) {
-        Write-Log "Hyper-V ja esta instalado." -Level OK
-        Add-FeatureResult -Name $name -Status 'JaPresente'
-        return
-    }
-
-    if (-not (Test-CanInstallOrDefer -Name $name)) { return }
-
-    Write-Log "Instalando Hyper-V (com ferramentas de gerenciamento)..." -Level STEP
-    Start-FeatureTimer -Name $name
-    # Install-WindowsFeature NAO tem -NoRestart; por padrao ja nao reinicia (so com -Restart).
-    $result = Install-WindowsFeature -Name Hyper-V -IncludeManagementTools
-
-    if ($result.Success) {
-        if ($result.RestartNeeded -ne 'No') {
-            Write-Log "Hyper-V instalado - REINICIO necessario para concluir." -Level WARN
-            Add-FeatureResult -Name $name -Status 'PrecisaReinicio' -Detail 'Concluir instalacao do Hyper-V'
-        } else {
-            Write-Log "Hyper-V instalado." -Level OK
-            Add-FeatureResult -Name $name -Status 'Instalado'
-        }
-    } else {
-        Write-Log "Falha ao instalar o Hyper-V. ExitCode: $($result.ExitCode)" -Level ERRO
-        Add-FeatureResult -Name $name -Status 'Falha' -Detail "ExitCode $($result.ExitCode)"
-    }
+    Write-Log "Verificando/instalando a role Hyper-V (via DISM)..." -Level STEP
+    Enable-OptionalFeatureSafe -FeatureName 'Microsoft-Hyper-V-All' -DisplayName 'Hyper-V' -All
 }
 
 # --- Telnet Client ----------------------------------------------------------
@@ -2686,7 +2661,9 @@ function Start-InstallWorker {
                     } catch {
                         Write-Log "Falha no job '$($job.Label)': $($_.Exception.Message)" -Level ERRO
                     } finally {
-                        $WINCFG_SIGNAL.Enqueue(@{ Type = 'JobDone'; Label = $job.Label; Tab = $job.Tab })
+                        $rb = $false
+                        try { if (@($Script:FeatureResults | Where-Object { $_.Status -eq 'PrecisaReinicio' }).Count -gt 0) { $rb = $true } } catch { }
+                        $WINCFG_SIGNAL.Enqueue(@{ Type = 'JobDone'; Label = $job.Label; Tab = $job.Tab; Reboot = $rb })
                     }
                 } else {
                     Start-Sleep -Milliseconds 150
@@ -2699,6 +2676,57 @@ function Start-InstallWorker {
         Write-Log "Worker indisponivel ($($_.Exception.Message)); modo sincrono." -Level WARN
         try { Remove-Item Env:\WINCFG_NOUI -ErrorAction SilentlyContinue } catch { }
         return $null
+    }
+}
+
+# Avisa que um item precisa reiniciar e REINICIA automaticamente apos uma
+# contagem (cancelavel). Chamada SO na thread da UI, quando a fila esvazia e
+# algum job registrou 'PrecisaReinicio'. Fechar a janela (X) ou "Adiar" cancela.
+function Invoke-RebootOffer {
+    param($Owner, [int] $Seconds = 60)
+    $x = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Reinicio necessario" Height="210" Width="470"
+        WindowStartupLocation="CenterOwner" Background="#FF1E1E1E" ResizeMode="NoResize">
+  <StackPanel Margin="16">
+    <TextBlock TextWrapping="Wrap" Foreground="#FFEEEEEE"
+               Text="Uma instalacao precisa REINICIAR o servidor para concluir (ex.: Hyper-V)."/>
+    <TextBlock x:Name="lblCount" Margin="0,14,0,0" FontWeight="Bold" FontSize="14" Foreground="#FFFFC83D"/>
+    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,20,0,0">
+      <Button x:Name="btnNow" Content="Reiniciar agora" Width="140" Height="32" Margin="0,0,8,0" Background="#FF6E1E1E" Foreground="White"/>
+      <Button x:Name="btnDefer" Content="Adiar (nao reiniciar)" Width="170" Height="32" Background="#FF3F3F46" Foreground="White"/>
+    </StackPanel>
+  </StackPanel>
+</Window>
+'@
+    try {
+        [xml]$xml = $x
+        $w = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $xml))
+        if ($Owner) { $w.Owner = $Owner }
+        $lbl = $w.FindName('lblCount'); $btnNow = $w.FindName('btnNow'); $btnDefer = $w.FindName('btnDefer')
+        $st = @{ Remaining = [int]$Seconds; Do = $false }
+        $lbl.Text = "Reinicio automatico em $($st.Remaining)s..."
+        $timer = New-Object System.Windows.Threading.DispatcherTimer
+        $timer.Interval = [TimeSpan]::FromSeconds(1)
+        $timer.Add_Tick({
+            $st.Remaining = $st.Remaining - 1
+            if ($st.Remaining -le 0) { $timer.Stop(); $st.Do = $true; $w.Close() }
+            else { $lbl.Text = "Reinicio automatico em $($st.Remaining)s..." }
+        }.GetNewClosure())
+        $btnNow.Add_Click({ $timer.Stop(); $st.Do = $true; $w.Close() }.GetNewClosure())
+        $btnDefer.Add_Click({ $timer.Stop(); $st.Do = $false; $w.Close() }.GetNewClosure())
+        $w.Add_Closing({ $timer.Stop() }.GetNewClosure())
+        $timer.Start()
+        $null = $w.ShowDialog()
+        if ($st.Do) {
+            Write-Log "Reiniciando o servidor para concluir a instalacao..." -Level WARN
+            try { Restart-Computer -Force } catch { Write-Log "Falha ao reiniciar: $($_.Exception.Message)" -Level ERRO }
+        } else {
+            Write-Log "Reinicio adiado. Reinicie manualmente para concluir a instalacao." -Level INFO
+        }
+    } catch {
+        Write-Log "Nao foi possivel mostrar o aviso de reinicio: $($_.Exception.Message)" -Level WARN
     }
 }
 
@@ -3006,6 +3034,7 @@ function Show-InstallerWpf {
     $uiSignals = [System.Collections.Queue]::Synchronized([System.Collections.Queue]::new())
     $ctrl      = [hashtable]::Synchronized(@{ Stop = $false })
     $Script:CurrentJobLabel = $null
+    $Script:RebootRequested = $false
 
     $logDir0 = if ($txtLog.Text.Trim()) { $txtLog.Text.Trim() } else { $Script:DefaultLogDir }
     $worker  = Start-InstallWorker -LiveLog $Script:LiveLog -JobQueue $jobQueue -UiSignals $uiSignals -Ctrl $ctrl -LogDir $logDir0
@@ -3069,6 +3098,7 @@ function Show-InstallerWpf {
                 if ($s.Type -eq 'JobStart') { $Script:CurrentJobLabel = $s.Label }
                 elseif ($s.Type -eq 'JobDone') {
                     $Script:CurrentJobLabel = $null
+                    if ($s.Reboot) { $Script:RebootRequested = $true }
                     & $repaintTab $s.Tab
                 }
             }
@@ -3079,6 +3109,11 @@ function Show-InstallerWpf {
                    elseif ($n -gt 0) { "Na fila: $n" } else { 'Ocioso.' }
             $lblQueue.Text = $txt
             $lblQueueFoot.Text = $txt
+            # (d) reinicio: oferece SO quando a fila esvazia e um job pediu reinicio
+            if ($Script:RebootRequested -and $jobQueue.Count -eq 0 -and -not $Script:CurrentJobLabel) {
+                $Script:RebootRequested = $false
+                Invoke-RebootOffer $win
+            }
         } finally { $Script:DrainBusy = $false }
     }.GetNewClosure())
     $logTimer.Start()
@@ -3113,7 +3148,7 @@ function Show-InstallerWpf {
             try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog
                 Invoke-CapabilityInstall -Ids $ids; $lblFeat.Text = Get-SummaryText
             } catch { $lblFeat.Text = "Erro: $($_.Exception.Message)" }
-            finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot; Add-WpfFeatureItems $spFeatures $win }
+            finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot; Add-WpfFeatureItems $spFeatures $win; if (Test-PendingReboot) { Invoke-RebootOffer $win } }
         }
     })
 
@@ -3187,7 +3222,7 @@ function Show-InstallerWpf {
                 if ($doReset)  { Invoke-IISReset }
                 Show-FeaturesSummary; $lblIis.Text = Get-SummaryText
             } catch { $lblIis.Text = "Erro: $($_.Exception.Message)" }
-            finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot; Add-WpfIisItems $spIis $win }
+            finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot; Add-WpfIisItems $spIis $win; if (Test-PendingReboot) { Invoke-RebootOffer $win } }
         }
     })
     $btnIisFull.Add_Click({
@@ -3198,7 +3233,7 @@ function Show-InstallerWpf {
         } else {
             try { & $setBusy $true; $win.Cursor = [System.Windows.Input.Cursors]::Wait; & $applyLog; Reset-FeatureSession; Install-IISFull; Show-FeaturesSummary; $lblIis.Text = Get-SummaryText }
             catch { $lblIis.Text = "Erro: $($_.Exception.Message)" }
-            finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot; Add-WpfIisItems $spIis $win }
+            finally { $win.Cursor = [System.Windows.Input.Cursors]::Arrow; & $setBusy $false; Set-WpfStatusPanel $spStatus $lblReboot; Add-WpfIisItems $spIis $win; if (Test-PendingReboot) { Invoke-RebootOffer $win } }
         }
     })
     $btnAspNet.Add_Click({

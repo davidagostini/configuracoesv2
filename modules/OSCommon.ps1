@@ -45,9 +45,12 @@ function Get-OSRole {
 
 # ============================================================================
 #  Catalogo de capacidades + dispatch por capacidade (nao por nome de SO)
-#  Ver docs/DESIGN-irm-gui.md secao 3. Das ~10 capacidades, so HyperV e
-#  Containers BIFURCAM (Install-WindowsFeature no Server vs DISM no Client);
-#  as demais usam os mesmos ids DISM nos dois SOs. Sandbox e client-only.
+#  Ver docs/DESIGN-irm-gui.md secao 3. Hoje so Containers BIFURCA
+#  (Install-WindowsFeature no Server vs DISM no Client). O Hyper-V usa DISM
+#  ('Microsoft-Hyper-V-All') nos dois SOs de proposito: no Server o
+#  Install-WindowsFeature do Hyper-V trava no Server Manager ("plug-in taking
+#  more time to load"). As demais usam os mesmos ids DISM nos dois SOs.
+#  Sandbox e client-only.
 # ============================================================================
 
 # AvailableOn: 'Both' | 'ClientOnly' | 'ServerOnly'.
@@ -73,7 +76,7 @@ function New-Capability {
 }
 
 $Script:CapabilityCatalog = @(
-    (New-Capability 'HyperV'        'Hyper-V'                         'Virtualizacao' 'Both'       @('Microsoft-Hyper-V-All') 'Hyper-V' -IncludeManagementTools -Notes 'Requer reinicio')
+    (New-Capability 'HyperV'        'Hyper-V'                         'Virtualizacao' 'Both'       @('Microsoft-Hyper-V-All') '' -Notes 'Via DISM; requer reinicio')
     (New-Capability 'Containers'    'Containers'                     'Virtualizacao' 'Both'       @('Containers') 'Containers')
     (New-Capability 'Sandbox'       'Windows Sandbox'                'Virtualizacao' 'ClientOnly' @('Containers-DisposableClientVM'))
     (New-Capability 'WSL'           'WSL'                            'Virtualizacao' 'Both'       @() '' -Notes 'wsl --update' -InstallFn 'Update-Wsl')
