@@ -107,6 +107,7 @@ $Script:SoftwareCatalog = @(
 
     # IDEs
     (New-Pkg 'vs2022'        'Visual Studio 2022 Community' 'IDE'   'visualstudio2022community' 'Microsoft.VisualStudio.2022.Community' @() @() 'no' 'Download grande')
+    (New-Pkg 'vs2026'        'Visual Studio 2026 Community' 'IDE'   'visualstudio2026community' 'Microsoft.VisualStudio.2026.Community' @() @() 'no' 'Download grande')
     (New-Pkg 'androidstudio' 'Android Studio'          'IDE'        'androidstudio' 'Google.AndroidStudio')
 
     # Containers
