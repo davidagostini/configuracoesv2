@@ -1,6 +1,6 @@
 # Estado atual do projeto (handoff)
 
-> Documento de retomada. Atualizado em 2026-06-19. Use isto + `CLAUDE.md` +
+> Documento de retomada. Atualizado em 2026-06-20. Use isto + `CLAUDE.md` +
 > `docs/DECISOES.md` para continuar de onde paramos (inclusive em outra maquina).
 
 ## Como retomar depois de formatar a maquina
@@ -53,6 +53,9 @@
   via DISM (`Microsoft-Hyper-V-All`); Server via `Install-WindowsFeature -IncludeManagementTools
   -Restart` (reinicia sozinho). Gerenciador de software **padrao = Chocolatey** (fallback winget).
   Ao esvaziar a fila, se ficou reinicio pendente, a GUI **avisa e reinicia** (`Invoke-RebootOffer`).
+  **Painel "Log ao vivo" confiavel**: o worker NAO escreve no console (`$Script:NoConsole`; o
+  `Write-Host` travava no runspace) — so arquivo + sink LiveLog, com marcadores `==> Iniciando` /
+  `<== Concluido`. **Cada aba confirma "Concluido: <job>"** ao fim (antes ficava em "Enfileirado...").
 
 ## Arquivos de runtime (NAO versionados; ficam na maquina alvo)
 
